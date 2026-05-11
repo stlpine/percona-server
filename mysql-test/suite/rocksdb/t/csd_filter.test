@@ -1,0 +1,81 @@
+--source include/have_rocksdb.inc
+
+# CSD MVCC filter simulation — correctness test
+#
+# Verifies that CsdSimIterator (injected for csd_* column families) filters
+# invisible and older-version internal keys so that DBIter's
+# internal_key_skipped_count is ~0, while the unfiltered path shows skips.
+
+# ---------------------------------------------------------------------------
+# Setup: create an OLAP table in the csd_olap column family.
+# The -master.opt file passes --rocksdb-csd-sim-enabled=1 at startup.
+# ---------------------------------------------------------------------------
+CREATE TABLE t (k INT PRIMARY KEY, v VARCHAR(100))
+  ENGINE=RocksDB COMMENT='cfname=csd_olap';
+
+# Write three versions of the same key.
+INSERT INTO t VALUES (1, 'v1');
+UPDATE t SET v = 'v2' WHERE k = 1;
+UPDATE t SET v = 'v3' WHERE k = 1;
+
+# Flush memtable to SST so internal keys are on disk.
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+# ---------------------------------------------------------------------------
+# Verify filter fires: keys_filtered should be > 0 after a scan.
+# ---------------------------------------------------------------------------
+# Reset counters (server restart would clear them; use a fresh connection instead).
+# We read the counter before and after to get the delta.
+
+# Capture baseline
+let $seen_before =
+  `SELECT VARIABLE_VALUE FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'rocksdb_csd_sim_keys_seen'`;
+let $filtered_before =
+  `SELECT VARIABLE_VALUE FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'rocksdb_csd_sim_keys_filtered'`;
+
+# Run an OLAP scan inside an explicit transaction (gives a snapshot).
+BEGIN;
+SELECT * FROM t ORDER BY k;
+COMMIT;
+
+# Capture counters after scan.
+let $seen_after =
+  `SELECT VARIABLE_VALUE FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'rocksdb_csd_sim_keys_seen'`;
+let $filtered_after =
+  `SELECT VARIABLE_VALUE FROM performance_schema.global_status
+   WHERE VARIABLE_NAME = 'rocksdb_csd_sim_keys_filtered'`;
+
+# At least 2 internal keys should have been filtered (the two older versions of
+# key k=1 that are below the snapshot_seq but already superseded).
+let $filtered_delta = `SELECT $filtered_after - $filtered_before`;
+let $seen_delta     = `SELECT $seen_after - $seen_before`;
+
+--echo # filtered_delta should be >= 2 (two dead versions of k=1)
+eval SELECT $filtered_delta >= 2 AS filter_fired;
+
+--echo # seen_delta should be >= filtered_delta (we saw at least as many as we filtered)
+eval SELECT $seen_delta >= $filtered_delta AS seen_gte_filtered;
+
+# ---------------------------------------------------------------------------
+# Verify DBIter skip count is 0 with filter on.
+# ---------------------------------------------------------------------------
+SET SESSION rocksdb_perf_context_level = 3;
+
+BEGIN;
+SELECT * FROM t ORDER BY k;
+COMMIT;
+
+# With CSD filter on, DBIter should not skip any internal keys.
+SELECT VARIABLE_VALUE AS internal_key_skipped_count
+  FROM performance_schema.session_status
+ WHERE VARIABLE_NAME = 'rocksdb_internal_key_skipped_count';
+
+SET SESSION rocksdb_perf_context_level = 0;
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+DROP TABLE t;

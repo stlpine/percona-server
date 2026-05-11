@@ -1,0 +1,32 @@
+CREATE TABLE t (k INT PRIMARY KEY, v VARCHAR(100))
+  ENGINE=RocksDB COMMENT='cfname=csd_olap';
+INSERT INTO t VALUES (1, 'v1');
+UPDATE t SET v = 'v2' WHERE k = 1;
+UPDATE t SET v = 'v3' WHERE k = 1;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+BEGIN;
+SELECT * FROM t ORDER BY k;
+k	v
+1	v3
+COMMIT;
+# filtered_delta should be >= 2 (two dead versions of k=1)
+SELECT $filtered_delta >= 2 AS filter_fired;
+filter_fired
+1
+# seen_delta should be >= filtered_delta (we saw at least as many as we filtered)
+SELECT $seen_delta >= $filtered_delta AS seen_gte_filtered;
+seen_gte_filtered
+1
+SET SESSION rocksdb_perf_context_level = 3;
+BEGIN;
+SELECT * FROM t ORDER BY k;
+k	v
+1	v3
+COMMIT;
+SELECT VARIABLE_VALUE AS internal_key_skipped_count
+  FROM performance_schema.session_status
+ WHERE VARIABLE_NAME = 'rocksdb_internal_key_skipped_count';
+internal_key_skipped_count
+0
+SET SESSION rocksdb_perf_context_level = 0;
+DROP TABLE t;
