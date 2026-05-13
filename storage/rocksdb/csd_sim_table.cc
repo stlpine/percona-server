@@ -4,6 +4,10 @@
 
 #include "rocksdb/table_reader_caller.h"
 
+namespace myrocks {
+extern bool rocksdb_csd_sim_enabled;
+}  // namespace myrocks
+
 rocksdb::InternalIterator *CsdSimTableReader::NewIterator(
     const rocksdb::ReadOptions &read_options,
     const rocksdb::SliceTransform *prefix_extractor, rocksdb::Arena *arena,
@@ -13,10 +17,12 @@ rocksdb::InternalIterator *CsdSimTableReader::NewIterator(
       read_options, prefix_extractor, arena, skip_filters, caller,
       compaction_readahead_size, allow_unprepared_value);
 
-  // Only wrap for user-facing forward scans with an explicit snapshot.
-  // Compaction, flush, and other internal readers must see all versions.
+  // Only wrap for user-facing forward scans with an explicit snapshot,
+  // and only when the runtime toggle is on. Compaction, flush, and other
+  // internal readers must always see all versions.
   if (caller != rocksdb::kUserIterator) return iter;
   if (read_options.snapshot == nullptr) return iter;
+  if (!myrocks::rocksdb_csd_sim_enabled) return iter;
 
   rocksdb::SequenceNumber snap_seq =
       read_options.snapshot->GetSequenceNumber();
