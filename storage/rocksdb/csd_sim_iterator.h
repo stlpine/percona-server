@@ -10,9 +10,13 @@
 
 // Global counters updated by CsdSimIterator destructors.
 // Exposed as SHOW STATUS variables rocksdb_csd_sim_keys_seen and
-// rocksdb_csd_sim_keys_filtered.
+// rocksdb_csd_sim_keys_filtered.  Defined in ha_rocksdb.cc inside namespace
+// myrocks — the extern must match that namespace to avoid a linker mismatch
+// that would silently leave the status variables at zero.
+namespace myrocks {
 extern std::atomic<uint64_t> rocksdb_csd_sim_keys_seen;
 extern std::atomic<uint64_t> rocksdb_csd_sim_keys_filtered;
+}  // namespace myrocks
 
 // CsdSimIterator wraps a BlockBasedTableIterator and simulates MVCC filter
 // pushdown to a Computational Storage Device.
@@ -32,10 +36,12 @@ class CsdSimIterator : public rocksdb::InternalIterator {
       : inner_(inner), snapshot_seq_(snapshot_seq) {}
 
   ~CsdSimIterator() override {
-    rocksdb_csd_sim_keys_seen.fetch_add(keys_seen_,
-                                        std::memory_order_relaxed);
-    rocksdb_csd_sim_keys_filtered.fetch_add(keys_filtered_,
-                                            std::memory_order_relaxed);
+    myrocks::rocksdb_csd_sim_keys_seen.fetch_add(keys_seen_,
+                                                  std::memory_order_relaxed);
+    myrocks::rocksdb_csd_sim_keys_filtered.fetch_add(keys_filtered_,
+                                                      std::memory_order_relaxed);
+    // inner_ was created with arena=nullptr (forced in CsdSimTableReader) so
+    // it is always heap-allocated and safe to delete here.
     delete inner_;
   }
 

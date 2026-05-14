@@ -13,8 +13,11 @@ rocksdb::InternalIterator *CsdSimTableReader::NewIterator(
     const rocksdb::SliceTransform *prefix_extractor, rocksdb::Arena *arena,
     bool skip_filters, rocksdb::TableReaderCaller caller,
     size_t compaction_readahead_size, bool allow_unprepared_value) {
+  // Pass nullptr for arena so inner_ is always heap-allocated.  This is
+  // required because CsdSimIterator::~CsdSimIterator calls "delete inner_",
+  // which is undefined behaviour on an arena-allocated object.
   rocksdb::InternalIterator *iter = inner_->NewIterator(
-      read_options, prefix_extractor, arena, skip_filters, caller,
+      read_options, prefix_extractor, /*arena=*/nullptr, skip_filters, caller,
       compaction_readahead_size, allow_unprepared_value);
 
   // Only wrap for user-facing forward scans with an explicit snapshot,
