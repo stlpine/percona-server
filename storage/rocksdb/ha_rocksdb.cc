@@ -1298,10 +1298,11 @@ static MYSQL_SYSVAR_BOOL(enable_bulk_load_api, rocksdb_enable_bulk_load_api,
 
 static MYSQL_SYSVAR_BOOL(
     csd_sim_enabled, rocksdb_csd_sim_enabled,
-    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-    "Enable in-process CSD MVCC filter simulation for column families whose "
-    "name starts with 'csd_'. Filters invisible and duplicate-version entries "
-    "below DBIter, simulating CSD pushdown. Requires restart.",
+    PLUGIN_VAR_RQCMDARG,
+    "Enable in-process CSD MVCC filter simulation. Wraps all user column "
+    "families with CsdSimIterator, which filters invisible and duplicate-"
+    "version entries below DBIter, simulating CSD pushdown. Dynamically "
+    "settable via SET GLOBAL rocksdb_csd_sim_enabled.",
     nullptr, nullptr, false);
 
 static MYSQL_SYSVAR_BOOL(

@@ -377,20 +377,18 @@ bool Rdb_cf_options::get_cf_options(const std::string &cf_name,
             Rdb_cf_manager::is_cf_name_reverse(cf_name));
   }
 
-  // CSD simulation: wrap the table factory for column families whose name
-  // starts with "csd_". Also force kNoCompression and 64 KB blocks to remove
-  // the decompression dependency (matching the proposal's prototype config).
-  // Always register CsdSimTableFactory at CF-setup time (called during
-  // DB::Open before MySQL system variables are applied, so rocksdb_csd_sim_enabled
-  // may still be false here). The runtime toggle is checked in NewIterator.
-  if (cf_name.size() >= 4 && cf_name.substr(0, 4) == "csd_") {
-    rocksdb::BlockBasedTableOptions bbto;
-    bbto.block_size = 65536;
-    opts->table_factory = std::make_shared<CsdSimTableFactory>(
-        std::shared_ptr<rocksdb::TableFactory>(
-            rocksdb::NewBlockBasedTableFactory(bbto)));
-    opts->compression = rocksdb::kNoCompression;
-    opts->bottommost_compression = rocksdb::kNoCompression;
+  // CSD simulation: wrap the table factory for all user column families.
+  // System/tmp CFs are excluded — they never go through kUserIterator so the
+  // CsdSimIterator would be a no-op anyway, but excluding them is safer.
+  // Registered at CF-setup time (DB::Open); the runtime flag
+  // (rocksdb_csd_sim_enabled) and caller != kUserIterator guards in
+  // NewIterator make this zero-cost when the flag is off or during
+  // compaction/flush.
+  if (cf_name != DEFAULT_SYSTEM_CF_NAME &&
+      cf_name != DEFAULT_TMP_CF_NAME &&
+      cf_name != DEFAULT_TMP_SYSTEM_CF_NAME) {
+    opts->table_factory =
+        std::make_shared<CsdSimTableFactory>(opts->table_factory);
   }
 
   return true;
