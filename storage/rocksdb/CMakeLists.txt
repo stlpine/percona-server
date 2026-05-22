@@ -276,7 +276,58 @@ SET(ROCKSDB_SE_SOURCES
   rdb_threads.cc rdb_threads.h
   ha_rockspart.cc ha_rockspart.h
   sql_dd.cc sql_dd.h
+  cemu_iterator.h
+  cemu_table.h cemu_table.cc
 )
+
+# ---------------------------------------------------------------------------
+# CEMU integration (optional — only active inside the CEMU VM build)
+#
+# cmake .. -DWITH_CEMU=/path/to/cemu/build ...
+#
+# When WITH_CEMU is set:
+#   - mysqld/rocksdb_se is compiled with -DHAVE_CEMU
+#   - libcemu.a and liburing are linked in
+#   - mvcc_filter.so CSF is built as a side target and installed to
+#     ${CMAKE_INSTALL_PREFIX}/lib/cemu_csf/mvcc_filter.so
+# ---------------------------------------------------------------------------
+SET(WITH_CEMU "" CACHE PATH "Path to CEMU build directory (enables CEMU CSD integration)")
+
+IF(WITH_CEMU)
+  IF(NOT EXISTS "${WITH_CEMU}/libcemu.a")
+    MESSAGE(FATAL_ERROR "WITH_CEMU set to '${WITH_CEMU}' but libcemu.a not found there")
+  ENDIF()
+
+  ADD_DEFINITIONS(-DHAVE_CEMU)
+  INCLUDE_DIRECTORIES(${WITH_CEMU}/include)
+
+  FIND_LIBRARY(URING_LIBRARY NAMES liburing.a uring HINTS ${WITH_CEMU}/lib)
+  IF(NOT URING_LIBRARY)
+    MESSAGE(FATAL_ERROR "liburing not found under ${WITH_CEMU}/lib (needed for CEMU)")
+  ENDIF()
+
+  SET(rocksdb_static_libs ${rocksdb_static_libs}
+      ${WITH_CEMU}/libcemu.a
+      ${URING_LIBRARY})
+
+  # Build mvcc_filter.so CSF — compiled standalone, not linked into mysqld.
+  ADD_CUSTOM_COMMAND(
+      OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/mvcc_filter.so
+      COMMAND ${CMAKE_CXX_COMPILER}
+              -shared -fPIC -O2 -std=c++17
+              -DHAVE_CEMU_SDK
+              -I${WITH_CEMU}/include
+              -o ${CMAKE_CURRENT_BINARY_DIR}/mvcc_filter.so
+              ${CMAKE_CURRENT_SOURCE_DIR}/cemu_csf/mvcc_filter.cc
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cemu_csf/mvcc_filter.cc)
+  ADD_CUSTOM_TARGET(mvcc_filter_so ALL
+      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mvcc_filter.so)
+
+  INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/mvcc_filter.so
+          DESTINATION lib/cemu_csf)
+
+  MESSAGE(STATUS "CEMU CSD integration enabled (${WITH_CEMU})")
+ENDIF()
 
 IF(WITH_FB_TSAN OR ROCKSDB_DYNAMIC_PLUGIN)
   SET(PIC_EXT "_pic")
