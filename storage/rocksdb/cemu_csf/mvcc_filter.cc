@@ -21,14 +21,17 @@
 //
 // Memory Range Set layout (set by CemuTableReader before CSF execution):
 //   mr[0]: input  — full SST file bytes (mapped from NVM namespace)
-//   mr[1]: output — FDM buffer for the filtered flat KV stream
+//   mr[1]: output — FDM buffer: 16-byte header followed by flat KV stream
 //
-// cparam1 (in):  snapshot_seq (uint64_t)
-// cparam2 (out): keys_seen counter (written by CSF, read by CemuTableReader)
+// cparam1 (in): snapshot_seq (uint64_t)
 //
-// Output format written to mr[1]:
-//   [uint32 key_len][key bytes][uint32 val_len][value bytes] ...
-// The caller (CemuResultIterator) reads this stream directly.
+// Output buffer layout (mr[1]):
+//   bytes  0-7:  result_bytes — number of KV-stream bytes that follow
+//   bytes 8-15:  keys_seen   — total internal keys examined
+//   bytes 16+:   [uint32 key_len][key bytes][uint32 val_len][value bytes] ...
+//
+// IOCTL_CEMU_EXECUTE is _IOW (write-only): the ioctl struct is NOT copied back
+// to userspace after execution.  All output must be encoded in mr[1].
 //
 // Compile (inside CEMU VM):
 //   g++ -shared -fPIC -O2 -std=c++17 \
@@ -265,11 +268,13 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
   const char *file_data = static_cast<const char *>(args->mr[0].addr);
   size_t file_len = args->mr[0].len;
   char *out_buf = static_cast<char *>(args->mr[1].addr);
-  const char *out_end = out_buf + args->mr[1].len;
+  const size_t out_capacity = args->mr[1].len;
   const uint64_t snapshot_seq = static_cast<uint64_t>(args->cparam1);
 
-  args->ret = 0;
-  args->cparam2 = 0;
+  // Header occupies the first 16 bytes; KV stream follows.
+  static const size_t kHeaderSize = 16;
+  if (out_capacity < kHeaderSize) return;
+  memset(out_buf, 0, kHeaderSize);
 
   // Locate the index block via the SST footer.
   BlockHandle index_bh;
@@ -291,8 +296,8 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
   const char *idx_entry_end = index_data + index_size - idx_restart_bytes;
 
   FilterState st{};
-  st.out_ptr = out_buf;
-  st.out_end = out_end;
+  st.out_ptr = out_buf + kHeaderSize;
+  st.out_end = out_buf + out_capacity;
 
   // Key buffer for reconstructing index block keys (separators — not needed
   // for data, but required to advance delta-decoding state correctly).
@@ -331,6 +336,12 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
                        &st);
   }
 
-  args->ret = static_cast<uint64_t>(st.out_ptr - out_buf);
-  args->cparam2 = static_cast<long long>(st.keys_seen);
+  // Write the 16-byte header: result_bytes (8) + keys_seen (8).
+  // IOCTL_CEMU_EXECUTE is _IOW so the ioctl struct is not returned; all
+  // output must live in the FDM buffer that the host reads via pread().
+  const uint64_t result_bytes =
+      static_cast<uint64_t>(st.out_ptr - (out_buf + kHeaderSize));
+  const uint64_t keys_seen = st.keys_seen;
+  memcpy(out_buf,     &result_bytes, 8);
+  memcpy(out_buf + 8, &keys_seen,    8);
 }

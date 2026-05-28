@@ -30,12 +30,16 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <vector>
-#include "cemu_nvme.h"  // CEMU-provided: cemu_prog_info, cemu_mrs_info,
-                        //               IOCTL_CEMU_{DOWNLOAD,ACTIVATE,
-                        //                           EXECUTE,DEACTIVATE,
-                        //                           CREATE_MRS,DELETE_MRS}
-#endif                  // HAVE_CEMU
+#include <stdlib.h>  // aligned_alloc, free
+#include "cemu_ioctl.h"  // ioctl_download, ioctl_execute, ioctl_create_mrs,
+                         // IOCTL_CEMU_{DOWNLOAD,ACTIVATE,EXECUTE,
+                         //             DEACTIVATE,CREATE_MRS,DELETE_MRS}
+// PROGRAM_TYPE_SHARED_LIB is defined in the CEMU test util.h enum; mirror it
+// here so we don't depend on that header.
+#ifndef PROGRAM_TYPE_SHARED_LIB
+#define PROGRAM_TYPE_SHARED_LIB 2
+#endif
+#endif  // HAVE_CEMU
 
 #include <atomic>
 #include <cstring>
@@ -55,6 +59,12 @@
 #ifndef CEMU_FDM_MOUNT
 #define CEMU_FDM_MOUNT "/mnt/fdm0"
 #endif
+
+// Output buffer header written by mvcc_filter CSF (16 bytes total):
+//   bytes 0-7:  result_bytes — number of KV-stream bytes that follow
+//   bytes 8-15: keys_seen   — total internal keys examined by the CSF
+// The KV stream starts at offset 16.
+static const size_t kCsfHeaderSize = 16;
 
 namespace myrocks {
 
@@ -97,7 +107,7 @@ rocksdb::Status CemuTableFactory::NewTableReader(
 CemuTableReader::~CemuTableReader() {
 #ifdef HAVE_CEMU
   if (csf_ready_ && cemu_fd_ >= 0) {
-    struct cemu_prog_info pi{};
+    struct ioctl_download pi{};
     pi.pind = pind_;
     ioctl(cemu_fd_, IOCTL_CEMU_DEACTIVATE, &pi);
     close(cemu_fd_);
@@ -113,51 +123,45 @@ bool CemuTableReader::EnsureCsfLoaded() {
     cemu_fd_ = open(CEMU_COMPUTE_DEV, O_RDWR);
     if (cemu_fd_ < 0) return;
 
-    // Read the .so into memory and send to the CSD.
-    int so_fd = open(CEMU_CSF_SO_PATH, O_RDONLY);
-    if (so_fd < 0) {
+    // Pack "<so_path>\0<func_name>\0" into a 4096-aligned buffer.
+    // The CSD kernel driver reads the .so by path from the shared filesystem
+    // (FDMFS or 9p mount), so we pass the path string — not the binary.
+    const char *func_name = "mvcc_filter";
+    const size_t path_len = strlen(CEMU_CSF_SO_PATH);
+    const size_t func_len = strlen(func_name);
+    const size_t buf_size = path_len + 1 + func_len + 1;
+    const size_t alloc_size = (buf_size + 4095) & ~static_cast<size_t>(4095);
+    char *prog_buf = static_cast<char *>(aligned_alloc(4096, alloc_size));
+    if (!prog_buf) {
+      close(cemu_fd_);
+      cemu_fd_ = -1;
+      return;
+    }
+    memcpy(prog_buf, CEMU_CSF_SO_PATH, path_len + 1);
+    memcpy(prog_buf + path_len + 1, func_name, func_len + 1);
+
+    struct ioctl_download dl{};
+    dl.addr = reinterpret_cast<uint64_t>(prog_buf);
+    dl.size = static_cast<int32_t>(buf_size);
+    dl.ptype = PROGRAM_TYPE_SHARED_LIB;
+    const int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
+    free(prog_buf);
+    if (dl_ret != 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
     }
 
-    struct stat st{};
-    if (fstat(so_fd, &st) != 0 || st.st_size == 0) {
-      close(so_fd);
-      close(cemu_fd_);
-      cemu_fd_ = -1;
-      return;
-    }
-
-    std::vector<char> so_buf(st.st_size);
-    if (read(so_fd, so_buf.data(), st.st_size) != st.st_size) {
-      close(so_fd);
-      close(cemu_fd_);
-      cemu_fd_ = -1;
-      return;
-    }
-    close(so_fd);
-
-    struct cemu_prog_info dl{};
-    dl.prog_type = CEMU_PROG_SHARED_LIB;
-    dl.prog_data = so_buf.data();
-    dl.prog_size = static_cast<uint32_t>(st.st_size);
-    strncpy(dl.func_name, "mvcc_filter", sizeof(dl.func_name) - 1);
-    if (ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl) != 0) {
-      close(cemu_fd_);
-      cemu_fd_ = -1;
-      return;
-    }
-
-    struct cemu_prog_info act{};
-    act.prog_id = dl.prog_id;
+    // Activate the downloaded program; pind from download is the program index.
+    struct ioctl_download act{};
+    act.pind = dl.pind;
     if (ioctl(cemu_fd_, IOCTL_CEMU_ACTIVATE, &act) != 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
     }
 
-    pind_ = act.pind;
+    pind_ = dl.pind;
     csf_ready_ = true;
   });
   return csf_ready_;
@@ -193,9 +197,8 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   const rocksdb::SequenceNumber snap_seq =
       read_options.snapshot->GetSequenceNumber();
 
-  // Open the full SST file so the CSD can map it into the MRS.
-  // The CSF parses the footer + index block to locate individual data blocks.
-  int sst_fd = open(file_path_.c_str(), O_RDONLY);
+  // Open the SST file so the CSD can map it as the MRS input region.
+  int sst_fd = open(file_path_.c_str(), O_RDWR);
   if (sst_fd < 0) {
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
@@ -216,6 +219,9 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   snprintf(out_path, sizeof(out_path), CEMU_FDM_MOUNT "/%llu_%lu.out",
            (unsigned long long)file_number_, (unsigned long)pthread_self());
 
+  // Output capacity: header (16 bytes) + up to file_size bytes of KV stream.
+  const uint64_t out_capacity = kCsfHeaderSize + file_size;
+
   int out_fd = open(out_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
   if (out_fd < 0) {
     close(sst_fd);
@@ -223,16 +229,28 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
   }
+  // Pre-allocate the output file so FDMFS can back it with device DRAM.
+  if (ftruncate(out_fd, static_cast<off_t>(out_capacity)) != 0) {
+    close(out_fd);
+    close(sst_fd);
+    unlink(out_path);
+    return inner_->NewIterator(read_options, prefix_extractor, arena,
+                               skip_filters, caller, compaction_readahead_size,
+                               allow_unprepared_value);
+  }
 
-  // Create Memory Range Set mapping [SST data blocks] → [FDM output buffer].
-  struct cemu_mrs_info mrs{};
-  mrs.mr[0].fd = sst_fd;
-  mrs.mr[0].offset = 0;
-  mrs.mr[0].size = file_size;
-  mrs.mr[1].fd = out_fd;
-  mrs.mr[1].offset = 0;
-  mrs.mr[1].size = file_size;  // filtered output ≤ input size
-  mrs.nr_mr = 2;
+  // Create Memory Range Set: mr[0] = SST input, mr[1] = FDM output.
+  // ioctl_create_mrs uses pointer arrays for fds / offsets / sizes.
+  int     mrs_fds[2]   = { sst_fd, out_fd };
+  long long mrs_offs[2] = { 0, 0 };
+  long long mrs_sizes[2] = { static_cast<long long>(file_size),
+                              static_cast<long long>(out_capacity) };
+
+  struct ioctl_create_mrs mrs{};
+  mrs.nr_fd = 2;
+  mrs.fd   = reinterpret_cast<uint64_t>(mrs_fds);
+  mrs.off  = reinterpret_cast<uint64_t>(mrs_offs);
+  mrs.size = reinterpret_cast<uint64_t>(mrs_sizes);
   if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) != 0) {
     close(out_fd);
     close(sst_fd);
@@ -243,12 +261,14 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   }
 
   // Execute the CSF synchronously.
-  struct cemu_exec_info exec{};
-  exec.pind = pind_;
-  exec.rsid = mrs.rsid;
-  exec.cparam1 = static_cast<long long>(snap_seq);
+  struct ioctl_execute exec{};
+  exec.pind   = static_cast<uint16_t>(pind_);
+  exec.rsid   = mrs.rsid;
+  exec.cparam1 = static_cast<uint64_t>(snap_seq);
   if (ioctl(cemu_fd_, IOCTL_CEMU_EXECUTE, &exec) != 0) {
-    ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &mrs);
+    struct ioctl_create_mrs del{};
+    del.rsid = mrs.rsid;
+    ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
     close(out_fd);
     close(sst_fd);
     unlink(out_path);
@@ -258,15 +278,31 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   }
 
   // MRS can be released immediately after execution completes.
-  ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &mrs);
+  {
+    struct ioctl_create_mrs del{};
+    del.rsid = mrs.rsid;
+    ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
+  }
   close(sst_fd);
 
-  // Read the flat KV stream from the FDM output buffer.
-  const size_t result_bytes = static_cast<size_t>(exec.ret);
+  // Read the 16-byte header written by mvcc_filter:
+  //   bytes 0-7:  result_bytes (KV stream length)
+  //   bytes 8-15: keys_seen
+  char hdr[kCsfHeaderSize] = {};
+  uint64_t result_bytes = 0;
+  uint64_t keys_seen    = 0;
+  if (pread(out_fd, hdr, kCsfHeaderSize, 0) ==
+      static_cast<ssize_t>(kCsfHeaderSize)) {
+    memcpy(&result_bytes, hdr,     8);
+    memcpy(&keys_seen,    hdr + 8, 8);
+  }
+
+  // Read the KV stream that follows the header.
   char *result_buf = nullptr;
   if (result_bytes > 0) {
     result_buf = new char[result_bytes];
-    if (pread(out_fd, result_buf, result_bytes, 0) !=
+    if (pread(out_fd, result_buf, result_bytes,
+              static_cast<off_t>(kCsfHeaderSize)) !=
         static_cast<ssize_t>(result_bytes)) {
       delete[] result_buf;
       result_buf = nullptr;
@@ -281,9 +317,7 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
                                allow_unprepared_value);
   }
 
-  // The CSF writes keys_seen to exec.cparam2 (args->cparam2 is writable by
-  // CSF). Count emitted entries by walking the flat result stream.
-  uint64_t keys_seen = static_cast<uint64_t>(exec.cparam2);
+  // Count emitted entries by walking the flat result stream.
   uint64_t keys_emitted = 0;
   {
     size_t scan = 0;
@@ -300,7 +334,7 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
       ++keys_emitted;
     }
   }
-  uint64_t keys_filtered =
+  const uint64_t keys_filtered =
       keys_seen > keys_emitted ? keys_seen - keys_emitted : 0;
 
   return new CemuResultIterator(result_buf, result_bytes, keys_seen,
