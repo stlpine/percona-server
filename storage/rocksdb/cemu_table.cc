@@ -141,7 +141,7 @@ bool CemuTableReader::EnsureCsfLoaded() {
     memcpy(prog_buf + path_len + 1, func_name, func_len + 1);
 
     struct ioctl_download dl{};
-    dl.addr = reinterpret_cast<uint64_t>(prog_buf);
+    dl.addr = prog_buf;
     dl.size = static_cast<int32_t>(buf_size);
     dl.ptype = PROGRAM_TYPE_SHARED_LIB;
     const int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
@@ -248,9 +248,9 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
 
   struct ioctl_create_mrs mrs{};
   mrs.nr_fd = 2;
-  mrs.fd   = reinterpret_cast<uint64_t>(mrs_fds);
-  mrs.off  = reinterpret_cast<uint64_t>(mrs_offs);
-  mrs.size = reinterpret_cast<uint64_t>(mrs_sizes);
+  mrs.fd   = mrs_fds;
+  mrs.off  = mrs_offs;
+  mrs.size = mrs_sizes;
   if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) != 0) {
     close(out_fd);
     close(sst_fd);

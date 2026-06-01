@@ -24,6 +24,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "table/multiget_context.h"
+#include "table/table_builder.h"
 #include "table/table_reader.h"
 
 // CemuTableReader wraps any TableReader and offloads MVCC filtering to the
