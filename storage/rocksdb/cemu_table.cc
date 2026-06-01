@@ -196,9 +196,28 @@ bool CemuTableReader::EnsureCsfLoaded() {
     dl.addr = prog_buf;
     dl.size = static_cast<int32_t>(buf_size);
     dl.ptype = PROGRAM_TYPE_SHARED_LIB;
-    const int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
-    free(prog_buf);
+    int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
     cemu_log("EnsureCsfLoaded: DOWNLOAD ret=%d pind=%d errno=%d", dl_ret, (int)dl.pind, errno);
+
+    if (dl_ret < 0 && errno == EEXIST) {
+      // Stale slot from a previous failed load — unload it and retry once.
+      cemu_log("EnsureCsfLoaded: EEXIST pind=%d, unloading stale slot", (int)dl.pind);
+      struct ioctl_download unload{};
+      unload.name = func_name;
+      unload.pind = dl.pind;
+      ioctl(cemu_fd_, IOCTL_CEMU_UNLOAD, &unload);
+
+      memset(&dl, 0, sizeof(dl));
+      dl.name = func_name;
+      dl.addr = prog_buf;
+      dl.size = static_cast<int32_t>(buf_size);
+      dl.ptype = PROGRAM_TYPE_SHARED_LIB;
+      dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
+      cemu_log("EnsureCsfLoaded: DOWNLOAD retry ret=%d pind=%d errno=%d",
+               dl_ret, (int)dl.pind, errno);
+    }
+
+    free(prog_buf);
     if (dl_ret < 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
