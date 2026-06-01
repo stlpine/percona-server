@@ -44,6 +44,21 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <stdio.h>
+
+// Temporary debug logger — writes to /tmp/cemu_debug.log.
+// Remove before production use.
+static void cemu_log(const char *fmt, ...) {
+  FILE *f = fopen("/tmp/cemu_debug.log", "a");
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
+#include <stdarg.h>
 
 // Path inside the CEMU VM where mvcc_filter.so is deployed.
 #ifndef CEMU_CSF_SO_PATH
@@ -97,6 +112,7 @@ rocksdb::Status CemuTableFactory::NewTableReader(
 
   *table_reader = std::make_unique<CemuTableReader>(
       std::move(inner_reader), std::move(file_path), file_number);
+  cemu_log("NewTableReader: wrapped file_number=%llu", (unsigned long long)file_number);
   return rocksdb::Status::OK();
 }
 
@@ -121,11 +137,9 @@ bool CemuTableReader::EnsureCsfLoaded() {
 #else
   std::call_once(csf_once_, [this]() {
     cemu_fd_ = open(CEMU_COMPUTE_DEV, O_RDWR);
+    cemu_log("EnsureCsfLoaded: open(%s) fd=%d errno=%d", CEMU_COMPUTE_DEV, cemu_fd_, errno);
     if (cemu_fd_ < 0) return;
 
-    // Pack "<so_path>\0<func_name>\0" into a 4096-aligned buffer.
-    // The CSD kernel driver reads the .so by path from the shared filesystem
-    // (FDMFS or 9p mount), so we pass the path string — not the binary.
     const char *func_name = "mvcc_filter";
     const size_t path_len = strlen(CEMU_CSF_SO_PATH);
     const size_t func_len = strlen(func_name);
@@ -133,12 +147,15 @@ bool CemuTableReader::EnsureCsfLoaded() {
     const size_t alloc_size = (buf_size + 4095) & ~static_cast<size_t>(4095);
     char *prog_buf = static_cast<char *>(aligned_alloc(4096, alloc_size));
     if (!prog_buf) {
+      cemu_log("EnsureCsfLoaded: aligned_alloc failed");
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
     }
     memcpy(prog_buf, CEMU_CSF_SO_PATH, path_len + 1);
     memcpy(prog_buf + path_len + 1, func_name, func_len + 1);
+    cemu_log("EnsureCsfLoaded: downloading so_path=%s func=%s buf_size=%zu",
+             CEMU_CSF_SO_PATH, func_name, buf_size);
 
     struct ioctl_download dl{};
     dl.addr = prog_buf;
@@ -146,16 +163,18 @@ bool CemuTableReader::EnsureCsfLoaded() {
     dl.ptype = PROGRAM_TYPE_SHARED_LIB;
     const int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
     free(prog_buf);
+    cemu_log("EnsureCsfLoaded: DOWNLOAD ret=%d pind=%d errno=%d", dl_ret, (int)dl.pind, errno);
     if (dl_ret < 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
     }
 
-    // Activate the downloaded program; pind from download is the program index.
     struct ioctl_download act{};
     act.pind = dl.pind;
-    if (ioctl(cemu_fd_, IOCTL_CEMU_ACTIVATE, &act) < 0) {
+    const int act_ret = ioctl(cemu_fd_, IOCTL_CEMU_ACTIVATE, &act);
+    cemu_log("EnsureCsfLoaded: ACTIVATE ret=%d errno=%d", act_ret, errno);
+    if (act_ret < 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
@@ -163,6 +182,7 @@ bool CemuTableReader::EnsureCsfLoaded() {
 
     pind_ = dl.pind;
     csf_ready_ = true;
+    cemu_log("EnsureCsfLoaded: ready pind=%d", pind_);
   });
   return csf_ready_;
 #endif  // HAVE_CEMU
@@ -175,8 +195,14 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
     size_t compaction_readahead_size, bool allow_unprepared_value) {
   // Guard: only wrap user-facing forward scans with an explicit snapshot.
   // Compaction, flush, and point-lookup paths must see all versions.
+  cemu_log("NewIterator: caller=%d snapshot=%p cemu_enabled=%d file=%s",
+           (int)caller, (void*)read_options.snapshot,
+           (int)myrocks::rocksdb_cemu_enabled, file_path_.c_str());
   if (caller != rocksdb::kUserIterator || read_options.snapshot == nullptr ||
       !myrocks::rocksdb_cemu_enabled) {
+    cemu_log("NewIterator: guard fallback caller=%d snap_null=%d enabled=%d",
+             (int)caller, read_options.snapshot == nullptr ? 1 : 0,
+             (int)myrocks::rocksdb_cemu_enabled);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
@@ -184,15 +210,18 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
 
 #ifndef HAVE_CEMU
   // CEMU not compiled in — transparent fallback.
+  cemu_log("NewIterator: HAVE_CEMU not defined, fallback");
   return inner_->NewIterator(read_options, prefix_extractor, arena,
                              skip_filters, caller, compaction_readahead_size,
                              allow_unprepared_value);
 #else
   if (!EnsureCsfLoaded()) {
+    cemu_log("NewIterator: EnsureCsfLoaded failed, fallback");
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
   }
+  cemu_log("NewIterator: CEMU path active pind=%d", pind_);
 
   const rocksdb::SequenceNumber snap_seq =
       read_options.snapshot->GetSequenceNumber();
