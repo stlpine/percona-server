@@ -146,7 +146,7 @@ bool CemuTableReader::EnsureCsfLoaded() {
     dl.ptype = PROGRAM_TYPE_SHARED_LIB;
     const int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
     free(prog_buf);
-    if (dl_ret != 0) {
+    if (dl_ret < 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
@@ -155,7 +155,7 @@ bool CemuTableReader::EnsureCsfLoaded() {
     // Activate the downloaded program; pind from download is the program index.
     struct ioctl_download act{};
     act.pind = dl.pind;
-    if (ioctl(cemu_fd_, IOCTL_CEMU_ACTIVATE, &act) != 0) {
+    if (ioctl(cemu_fd_, IOCTL_CEMU_ACTIVATE, &act) < 0) {
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
@@ -251,7 +251,7 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   mrs.fd   = mrs_fds;
   mrs.off  = mrs_offs;
   mrs.size = mrs_sizes;
-  if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) != 0) {
+  if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) < 0) {
     close(out_fd);
     close(sst_fd);
     unlink(out_path);
@@ -265,7 +265,7 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   exec.pind   = static_cast<uint16_t>(pind_);
   exec.rsid   = mrs.rsid;
   exec.cparam1 = static_cast<uint64_t>(snap_seq);
-  if (ioctl(cemu_fd_, IOCTL_CEMU_EXECUTE, &exec) != 0) {
+  if (ioctl(cemu_fd_, IOCTL_CEMU_EXECUTE, &exec) < 0) {
     struct ioctl_create_mrs del{};
     del.rsid = mrs.rsid;
     ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
