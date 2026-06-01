@@ -136,7 +136,8 @@ class CemuTableReader : public rocksdb::TableReader {
   uint64_t file_number_;
 
   // CEMU state — initialised lazily by EnsureCsfLoaded().
-  int cemu_fd_ = -1;  // fd for /dev/nvme0c3
+  int cemu_fd_ = -1;  // fd for /dev/nvme0c3 (control: download/activate/mrs)
+  int ng_fd_   = -1;  // fd for /dev/ng0n3   (NVMe generic passthru for execute)
   int pind_ = -1;     // program index after CSF activation
   bool csf_ready_ = false;
   mutable std::once_flag csf_once_;

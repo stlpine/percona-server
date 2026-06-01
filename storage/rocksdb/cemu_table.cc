@@ -31,14 +31,37 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdlib.h>  // aligned_alloc, free
-#include "cemu_ioctl.h"  // ioctl_download, ioctl_execute, ioctl_create_mrs,
-                         // IOCTL_CEMU_{DOWNLOAD,ACTIVATE,EXECUTE,
-                         //             DEACTIVATE,CREATE_MRS,DELETE_MRS}
-// PROGRAM_TYPE_SHARED_LIB is defined in the CEMU test util.h enum; mirror it
-// here so we don't depend on that header.
+#include <linux/nvme_ioctl.h>  // nvme_passthru_cmd, NVME_IOCTL_IO_CMD
+#include "cemu_ioctl.h"  // ioctl_download, ioctl_create_mrs,
+                         // IOCTL_CEMU_{DOWNLOAD,ACTIVATE,DEACTIVATE,
+                         //             CREATE_MRS,DELETE_MRS}
 #ifndef PROGRAM_TYPE_SHARED_LIB
 #define PROGRAM_TYPE_SHARED_LIB 2
 #endif
+
+// NVMe vendor command layout for CEMU program execution.
+// Overlays the first 64 bytes of struct nvme_passthru_cmd.
+// Matches struct nvme_program_execute_cmd in CEMU/tests/cemu/util.h.
+struct nvme_program_execute_cmd {
+  uint8_t  opcode;
+  uint8_t  flags;
+  uint16_t cid;
+  uint32_t nsid;
+  uint16_t pind;
+  uint16_t rsid;
+  uint32_t numr;
+  uint32_t dlen;
+  uint32_t rsvd;
+  uint64_t prp1;
+  uint64_t prp2;
+  uint64_t cparam1;
+  uint64_t cparam2;
+  uint32_t group     : 8;
+  uint32_t chunk_nlb : 24;
+  uint32_t user_runtime;
+};
+static_assert(sizeof(nvme_program_execute_cmd) == 64,
+              "nvme_program_execute_cmd must be 64 bytes");
 #endif  // HAVE_CEMU
 
 #include <atomic>
@@ -68,6 +91,11 @@ static void cemu_log(const char *fmt, ...) {
 // Compute namespace device node exposed by CEMU.
 #ifndef CEMU_COMPUTE_DEV
 #define CEMU_COMPUTE_DEV "/dev/nvme0c3"
+#endif
+
+// NVMe generic passthru device for program execution (namespace 3).
+#ifndef CEMU_NG_DEV
+#define CEMU_NG_DEV "/dev/ng0n3"
 #endif
 
 // FDM mount point — on-device DRAM filesystem.
@@ -128,6 +156,7 @@ CemuTableReader::~CemuTableReader() {
     ioctl(cemu_fd_, IOCTL_CEMU_DEACTIVATE, &pi);
     close(cemu_fd_);
   }
+  if (ng_fd_ >= 0) close(ng_fd_);
 #endif
 }
 
@@ -158,6 +187,7 @@ bool CemuTableReader::EnsureCsfLoaded() {
              CEMU_CSF_SO_PATH, func_name, buf_size);
 
     struct ioctl_download dl{};
+    dl.name = func_name;  // required — DOWNLOAD returns EFAULT if name is null
     dl.addr = prog_buf;
     dl.size = static_cast<int32_t>(buf_size);
     dl.ptype = PROGRAM_TYPE_SHARED_LIB;
@@ -181,8 +211,20 @@ bool CemuTableReader::EnsureCsfLoaded() {
     }
 
     pind_ = dl.pind;
+
+    ng_fd_ = open(CEMU_NG_DEV, O_RDWR);
+    cemu_log("EnsureCsfLoaded: open(%s) ng_fd=%d errno=%d", CEMU_NG_DEV, ng_fd_, errno);
+    if (ng_fd_ < 0) {
+      struct ioctl_download deact{};
+      deact.pind = pind_;
+      ioctl(cemu_fd_, IOCTL_CEMU_DEACTIVATE, &deact);
+      close(cemu_fd_);
+      cemu_fd_ = -1;
+      return;
+    }
+
     csf_ready_ = true;
-    cemu_log("EnsureCsfLoaded: ready pind=%d", pind_);
+    cemu_log("EnsureCsfLoaded: ready pind=%d ng_fd=%d", pind_, ng_fd_);
   });
   return csf_ready_;
 #endif  // HAVE_CEMU
@@ -226,9 +268,11 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   const rocksdb::SequenceNumber snap_seq =
       read_options.snapshot->GetSequenceNumber();
 
-  // Open the SST file so the CSD can map it as the MRS input region.
-  int sst_fd = open(file_path_.c_str(), O_RDWR);
+  // Open SST file to copy its content into the FDM input file.
+  // MRS only accepts FDMFS fds, so the SST must be staged into FDM first.
+  int sst_fd = open(file_path_.c_str(), O_RDONLY);
   if (sst_fd < 0) {
+    cemu_log("NewIterator: open SST failed errno=%d", errno);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
@@ -242,103 +286,156 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   }
   const uint64_t file_size = static_cast<uint64_t>(sst_st.st_size);
 
-  // FDM output buffer path — unique per file + thread to support concurrent
-  // scans of the same SST from multiple OLAP threads.
-  char out_path[256];
-  snprintf(out_path, sizeof(out_path), CEMU_FDM_MOUNT "/%llu_%lu.out",
+  // Unique FDM paths per file+thread for concurrent scan support.
+  char fdm_in_path[256], fdm_out_path[256];
+  snprintf(fdm_in_path, sizeof(fdm_in_path), CEMU_FDM_MOUNT "/%llu_%lu.in",
+           (unsigned long long)file_number_, (unsigned long)pthread_self());
+  snprintf(fdm_out_path, sizeof(fdm_out_path), CEMU_FDM_MOUNT "/%llu_%lu.out",
            (unsigned long long)file_number_, (unsigned long)pthread_self());
 
-  // Output capacity: header (16 bytes) + up to file_size bytes of KV stream.
-  const uint64_t out_capacity = kCsfHeaderSize + file_size;
-
-  int out_fd = open(out_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-  if (out_fd < 0) {
+  // Create FDM input file and copy SST content into it.
+  int fdm_in_fd = open(fdm_in_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fdm_in_fd < 0) {
+    cemu_log("NewIterator: open FDM input failed path=%s errno=%d",
+             fdm_in_path, errno);
     close(sst_fd);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
   }
-  // Pre-allocate the output file so FDMFS can back it with device DRAM.
-  if (ftruncate(out_fd, static_cast<off_t>(out_capacity)) != 0) {
-    close(out_fd);
-    close(sst_fd);
-    unlink(out_path);
+  if (ftruncate(fdm_in_fd, static_cast<off_t>(file_size)) != 0) {
+    close(fdm_in_fd); unlink(fdm_in_path); close(sst_fd);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
   }
-
-  // Create Memory Range Set: mr[0] = SST input, mr[1] = FDM output.
-  // ioctl_create_mrs uses pointer arrays for fds / offsets / sizes.
-  int     mrs_fds[2]   = { sst_fd, out_fd };
-  long long mrs_offs[2] = { 0, 0 };
-  long long mrs_sizes[2] = { static_cast<long long>(file_size),
-                              static_cast<long long>(out_capacity) };
-
-  struct ioctl_create_mrs mrs{};
-  mrs.nr_fd = 2;
-  mrs.fd   = mrs_fds;
-  mrs.off  = mrs_offs;
-  mrs.size = mrs_sizes;
-  if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) < 0) {
-    close(out_fd);
-    close(sst_fd);
-    unlink(out_path);
-    return inner_->NewIterator(read_options, prefix_extractor, arena,
-                               skip_filters, caller, compaction_readahead_size,
-                               allow_unprepared_value);
-  }
-
-  // Execute the CSF synchronously.
-  struct ioctl_execute exec{};
-  exec.pind   = static_cast<uint16_t>(pind_);
-  exec.rsid   = mrs.rsid;
-  exec.cparam1 = static_cast<uint64_t>(snap_seq);
-  if (ioctl(cemu_fd_, IOCTL_CEMU_EXECUTE, &exec) < 0) {
-    struct ioctl_create_mrs del{};
-    del.rsid = mrs.rsid;
-    ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
-    close(out_fd);
-    close(sst_fd);
-    unlink(out_path);
-    return inner_->NewIterator(read_options, prefix_extractor, arena,
-                               skip_filters, caller, compaction_readahead_size,
-                               allow_unprepared_value);
-  }
-
-  // MRS can be released immediately after execution completes.
   {
-    struct ioctl_create_mrs del{};
-    del.rsid = mrs.rsid;
-    ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
+    char copy_buf[65536];
+    off_t offset = 0;
+    size_t remaining = file_size;
+    bool copy_ok = true;
+    while (remaining > 0 && copy_ok) {
+      size_t chunk = remaining < sizeof(copy_buf) ? remaining : sizeof(copy_buf);
+      ssize_t nr = pread(sst_fd, copy_buf, chunk, offset);
+      if (nr <= 0) { copy_ok = false; break; }
+      if (pwrite(fdm_in_fd, copy_buf, static_cast<size_t>(nr), offset) != nr) {
+        copy_ok = false; break;
+      }
+      offset += nr;
+      remaining -= static_cast<size_t>(nr);
+    }
+    if (!copy_ok) {
+      cemu_log("NewIterator: SST→FDM copy failed at offset=%lld errno=%d",
+               (long long)offset, errno);
+      close(fdm_in_fd); unlink(fdm_in_path); close(sst_fd);
+      return inner_->NewIterator(read_options, prefix_extractor, arena,
+                                 skip_filters, caller, compaction_readahead_size,
+                                 allow_unprepared_value);
+    }
   }
   close(sst_fd);
+  cemu_log("NewIterator: SST copied to FDM path=%s size=%llu",
+           fdm_in_path, (unsigned long long)file_size);
 
-  // Read the 16-byte header written by mvcc_filter:
+  // Create FDM output file: header (16 bytes) + up to file_size KV stream.
+  const uint64_t out_capacity = kCsfHeaderSize + file_size;
+  int fdm_out_fd = open(fdm_out_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fdm_out_fd < 0) {
+    cemu_log("NewIterator: open FDM output failed errno=%d", errno);
+    close(fdm_in_fd); unlink(fdm_in_path);
+    return inner_->NewIterator(read_options, prefix_extractor, arena,
+                               skip_filters, caller, compaction_readahead_size,
+                               allow_unprepared_value);
+  }
+  if (ftruncate(fdm_out_fd, static_cast<off_t>(out_capacity)) != 0) {
+    close(fdm_out_fd); unlink(fdm_out_path);
+    close(fdm_in_fd); unlink(fdm_in_path);
+    return inner_->NewIterator(read_options, prefix_extractor, arena,
+                               skip_filters, caller, compaction_readahead_size,
+                               allow_unprepared_value);
+  }
+
+  // CREATE_MRS: mr[0]=FDM input (SST copy), mr[1]=FDM output.
+  int       mrs_fds[2]   = { fdm_in_fd, fdm_out_fd };
+  long long mrs_offs[2]  = { 0, 0 };
+  long long mrs_sizes[2] = { static_cast<long long>(file_size),
+                              static_cast<long long>(out_capacity) };
+  struct ioctl_create_mrs mrs{};
+  mrs.nr_fd = 2;
+  mrs.fd    = mrs_fds;
+  mrs.off   = mrs_offs;
+  mrs.size  = mrs_sizes;
+  if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) < 0) {
+    cemu_log("NewIterator: CREATE_MRS failed errno=%d", errno);
+    close(fdm_out_fd); unlink(fdm_out_path);
+    close(fdm_in_fd); unlink(fdm_in_path);
+    return inner_->NewIterator(read_options, prefix_extractor, arena,
+                               skip_filters, caller, compaction_readahead_size,
+                               allow_unprepared_value);
+  }
+  cemu_log("NewIterator: CREATE_MRS ok rsid=%d", (int)mrs.rsid);
+
+  // Execute CSF via NVMe passthru on /dev/ng0n3 (same mechanism as vadd_example).
+  // nvme_program_execute_cmd overlays the first 64 bytes of nvme_passthru_cmd.
+  {
+    struct nvme_passthru_cmd nvme_cmd{};
+    struct nvme_program_execute_cmd *exec =
+        reinterpret_cast<struct nvme_program_execute_cmd *>(&nvme_cmd);
+    exec->opcode  = 0x01;
+    exec->nsid    = 3;
+    exec->pind    = static_cast<uint16_t>(pind_);
+    exec->rsid    = mrs.rsid;
+    exec->cparam1 = static_cast<uint64_t>(snap_seq);
+    cemu_log("NewIterator: EXECUTE pind=%d rsid=%d snap_seq=%llu",
+             (int)pind_, (int)mrs.rsid, (unsigned long long)snap_seq);
+    const int exec_ret = ioctl(ng_fd_, NVME_IOCTL_IO_CMD, &nvme_cmd);
+    cemu_log("NewIterator: EXECUTE ret=%d errno=%d", exec_ret, errno);
+    if (exec_ret < 0) {
+      struct ioctl_create_mrs del{}; del.rsid = mrs.rsid;
+      ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
+      close(fdm_out_fd); unlink(fdm_out_path);
+      close(fdm_in_fd); unlink(fdm_in_path);
+      return inner_->NewIterator(read_options, prefix_extractor, arena,
+                                 skip_filters, caller, compaction_readahead_size,
+                                 allow_unprepared_value);
+    }
+  }
+
+  // Release MRS and FDM input file — no longer needed after execution.
+  {
+    struct ioctl_create_mrs del{}; del.rsid = mrs.rsid;
+    ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
+  }
+  close(fdm_in_fd);
+  unlink(fdm_in_path);
+
+  // Read the 16-byte header written by mvcc_filter into the FDM output file:
   //   bytes 0-7:  result_bytes (KV stream length)
   //   bytes 8-15: keys_seen
   char hdr[kCsfHeaderSize] = {};
   uint64_t result_bytes = 0;
   uint64_t keys_seen    = 0;
-  if (pread(out_fd, hdr, kCsfHeaderSize, 0) ==
+  if (pread(fdm_out_fd, hdr, kCsfHeaderSize, 0) ==
       static_cast<ssize_t>(kCsfHeaderSize)) {
     memcpy(&result_bytes, hdr,     8);
     memcpy(&keys_seen,    hdr + 8, 8);
   }
+  cemu_log("NewIterator: result_bytes=%llu keys_seen=%llu",
+           (unsigned long long)result_bytes, (unsigned long long)keys_seen);
 
   // Read the KV stream that follows the header.
   char *result_buf = nullptr;
   if (result_bytes > 0) {
     result_buf = new char[result_bytes];
-    if (pread(out_fd, result_buf, result_bytes,
+    if (pread(fdm_out_fd, result_buf, result_bytes,
               static_cast<off_t>(kCsfHeaderSize)) !=
         static_cast<ssize_t>(result_bytes)) {
       delete[] result_buf;
       result_buf = nullptr;
     }
   }
-  close(out_fd);
-  unlink(out_path);
+  close(fdm_out_fd);
+  unlink(fdm_out_path);
 
   if (!result_buf && result_bytes > 0) {
     return inner_->NewIterator(read_options, prefix_extractor, arena,
