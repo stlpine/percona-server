@@ -110,9 +110,14 @@ static inline void write_uint32_le(char *dst, uint32_t v) {
 // ---------------------------------------------------------------------------
 
 static const uint64_t kBlockBasedMagic = 0x88e241b785f4cff7ULL;
-// New-format footer: 1-byte checksum + 2×BlockHandle + padding + 4-byte
-// version + 8-byte magic = 53 bytes (Percona/RocksDB 8.x).
+// New-format footer: 1-byte checksum + 40-byte part2 + 4-byte version +
+// 8-byte magic = 53 bytes (Percona/RocksDB 8.x).
 static const size_t kFooterSize = 53;
+// Block trailer: 1-byte compression type + 4-byte checksum.
+static const size_t kBlockTrailerSize = 5;
+// Metaindex key for the index block (RocksDB 8.x).
+static const char kIndexBlockKey[] = "rocksdb.index";
+static const size_t kIndexBlockKeyLen = 13;
 
 struct BlockHandle {
   uint64_t offset;
@@ -126,7 +131,51 @@ static const char *decode_block_handle(const char *p, const char *limit,
   return decode_varint64(p, limit, &bh->size);
 }
 
+// Scans the metaindex block for the "rocksdb.index" entry and returns its
+// BlockHandle.  Returns true on success.
+static bool parse_metaindex_for_index(const char *block_data, size_t block_size,
+                                      BlockHandle *index_bh) {
+  if (block_size < 4) return false;
+  uint32_t num_restarts;
+  memcpy(&num_restarts, block_data + block_size - 4, 4);
+  if (num_restarts == 0) num_restarts = 1;
+  const size_t restart_bytes = (size_t)(1 + num_restarts) * 4;
+  if (restart_bytes > block_size) return false;
+  const char *entry_end = block_data + block_size - restart_bytes;
+
+  char key_buf[256];
+  size_t key_buf_len = 0;
+  const char *p = block_data;
+
+  while (p < entry_end) {
+    uint32_t shared, non_shared, val_len;
+    p = decode_varint32(p, entry_end, &shared);
+    if (!p) break;
+    p = decode_varint32(p, entry_end, &non_shared);
+    if (!p) break;
+    p = decode_varint32(p, entry_end, &val_len);
+    if (!p) break;
+    if ((size_t)(entry_end - p) < (size_t)(non_shared + val_len)) break;
+
+    const size_t full_key_len = shared + non_shared;
+    if (full_key_len > sizeof(key_buf) || shared > key_buf_len) break;
+    memcpy(key_buf + shared, p, non_shared);
+    key_buf_len = full_key_len;
+
+    const char *val_ptr = p + non_shared;
+    p = val_ptr + val_len;
+
+    if (full_key_len == kIndexBlockKeyLen &&
+        memcmp(key_buf, kIndexBlockKey, kIndexBlockKeyLen) == 0) {
+      return decode_block_handle(val_ptr, val_ptr + val_len, index_bh) != nullptr;
+    }
+  }
+  return false;
+}
+
 // Parses the SST footer and returns the index block handle.
+// Handles both format_version <= 5 (index handle in footer) and
+// format_version >= 6 (index handle in metaindex block).
 // Returns true on success, false if the file is too small or magic mismatches.
 static bool parse_footer(const char *file_data, size_t file_len,
                          BlockHandle *index_bh) {
@@ -141,17 +190,37 @@ static bool parse_footer(const char *file_data, size_t file_len,
   uint32_t version;
   memcpy(&version, fp + kFooterSize - 12, 4);
 
-  // Version >= 1: first byte is the checksum type; version 0 has no prefix.
-  const char *p = (version >= 1) ? fp + 1 : fp;
-  const char *limit = fp + kFooterSize - 12;  // before version + magic
+  if (version >= 6) {
+    // Part2 layout (starting at fp[1], after checksum type byte):
+    //   [0..3]   extended magic: 0x3e 0x00 0x7a 0x00
+    //   [4..7]   footer_checksum (uint32LE)
+    //   [8..11]  base_context_checksum (uint32LE)
+    //   [12..15] metaindex_size (uint32LE)  ← bytes fp[13..16]
+    //   [16..31] 16 bytes unchecked reserved padding
+    //   [32..39] 8 bytes checked reserved padding
+    uint32_t metaindex_size;
+    memcpy(&metaindex_size, fp + 1 + 12, 4);
+    if (metaindex_size == 0 || metaindex_size > file_len) return false;
 
-  // Skip metaindex block handle.
-  BlockHandle meta_bh;
-  p = decode_block_handle(p, limit, &meta_bh);
-  if (!p) return false;
+    // Metaindex is immediately before the footer, separated by a block trailer.
+    const size_t footer_offset = file_len - kFooterSize;
+    if (footer_offset < kBlockTrailerSize + metaindex_size) return false;
+    const size_t metaindex_offset = footer_offset - kBlockTrailerSize - metaindex_size;
 
-  p = decode_block_handle(p, limit, index_bh);
-  return p != nullptr;
+    return parse_metaindex_for_index(file_data + metaindex_offset,
+                                     metaindex_size, index_bh);
+  } else {
+    // Version 1-5: part2 contains metaindex handle + index handle (varints).
+    const char *p = fp + 1;  // skip checksum type
+    const char *limit = fp + kFooterSize - 12;  // before version + magic
+
+    BlockHandle meta_bh;
+    p = decode_block_handle(p, limit, &meta_bh);
+    if (!p) return false;
+
+    p = decode_block_handle(p, limit, index_bh);
+    return p != nullptr;
+  }
 }
 
 // ---------------------------------------------------------------------------
