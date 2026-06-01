@@ -311,24 +311,25 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   }
 
   // Copy SST content into FDM input file at offset 0.
+  // FDMFS uses iomap_dio_rw for all I/O: buffer and size must be 4096-aligned.
   {
-    char copy_buf[65536];
-    off_t offset = 0;
-    size_t remaining = file_size;
-    bool copy_ok = true;
-    while (remaining > 0 && copy_ok) {
-      size_t chunk = remaining < sizeof(copy_buf) ? remaining : sizeof(copy_buf);
-      ssize_t nr = pread(sst_fd, copy_buf, chunk, offset);
-      if (nr <= 0) { copy_ok = false; break; }
-      if (pwrite(fdm_in_fd, copy_buf, static_cast<size_t>(nr), offset) != nr) {
-        copy_ok = false; break;
+    const size_t aligned_size = (file_size + 4095) & ~static_cast<size_t>(4095);
+    char *copy_buf = static_cast<char *>(aligned_alloc(4096, aligned_size));
+    bool copy_ok = false;
+    if (copy_buf) {
+      memset(copy_buf, 0, aligned_size);
+      ssize_t nr = pread(sst_fd, copy_buf, file_size, 0);
+      if (nr == static_cast<ssize_t>(file_size)) {
+        ssize_t nw = pwrite(fdm_in_fd, copy_buf, aligned_size, 0);
+        copy_ok = (nw == static_cast<ssize_t>(aligned_size));
+        if (!copy_ok)
+          cemu_log("NewIterator: FDM pwrite failed nw=%zd errno=%d", nw, errno);
+      } else {
+        cemu_log("NewIterator: SST pread failed nr=%zd errno=%d", nr, errno);
       }
-      offset += nr;
-      remaining -= static_cast<size_t>(nr);
+      free(copy_buf);
     }
     if (!copy_ok) {
-      cemu_log("NewIterator: SST→FDM copy failed offset=%lld errno=%d",
-               (long long)offset, errno);
       close(fdm_in_fd); close(sst_fd);
       return inner_->NewIterator(read_options, prefix_extractor, arena,
                                  skip_filters, caller, compaction_readahead_size,
