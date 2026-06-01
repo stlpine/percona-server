@@ -83,6 +83,11 @@ static void cemu_log(const char *fmt, ...) {
 }
 #include <stdarg.h>
 
+// Global mutex serialising all CEMU executions.
+// FDMFS pre-allocates a fixed set of files; concurrent writers would corrupt
+// each other's data.  A single pair (input=0, output=1) is used for now.
+static std::mutex g_cemu_exec_mutex;
+
 // Path inside the CEMU VM where mvcc_filter.so is deployed.
 #ifndef CEMU_CSF_SO_PATH
 #define CEMU_CSF_SO_PATH "/opt/cemu_csf/mvcc_filter.so"
@@ -268,8 +273,11 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   const rocksdb::SequenceNumber snap_seq =
       read_options.snapshot->GetSequenceNumber();
 
-  // Open SST file to copy its content into the FDM input file.
-  // MRS only accepts FDMFS fds, so the SST must be staged into FDM first.
+  // Serialize all CEMU executions — FDMFS pre-allocates a fixed file pool;
+  // concurrent writers would overlap.
+  std::lock_guard<std::mutex> cemu_lock(g_cemu_exec_mutex);
+
+  // Open SST file and measure its size.
   int sst_fd = open(file_path_.c_str(), O_RDONLY);
   if (sst_fd < 0) {
     cemu_log("NewIterator: open SST failed errno=%d", errno);
@@ -285,30 +293,24 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
                                allow_unprepared_value);
   }
   const uint64_t file_size = static_cast<uint64_t>(sst_st.st_size);
+  const uint64_t out_capacity = kCsfHeaderSize + file_size;
 
-  // Unique FDM paths per file+thread for concurrent scan support.
-  char fdm_in_path[256], fdm_out_path[256];
-  snprintf(fdm_in_path, sizeof(fdm_in_path), CEMU_FDM_MOUNT "/%llu_%lu.in",
-           (unsigned long long)file_number_, (unsigned long)pthread_self());
-  snprintf(fdm_out_path, sizeof(fdm_out_path), CEMU_FDM_MOUNT "/%llu_%lu.out",
-           (unsigned long long)file_number_, (unsigned long)pthread_self());
+  // Use pre-existing FDMFS files — FDMFS does not support writes to
+  // dynamically created files (kernel NULL deref in fdmfs_iomap_begin).
+  // Files 0 and 1 are pre-allocated at mount time (32 MB each).
+  const char *fdm_in_path  = CEMU_FDM_MOUNT "/0";
+  const char *fdm_out_path = CEMU_FDM_MOUNT "/1";
 
-  // Create FDM input file and copy SST content into it.
-  int fdm_in_fd = open(fdm_in_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  int fdm_in_fd = open(fdm_in_path, O_RDWR);
   if (fdm_in_fd < 0) {
-    cemu_log("NewIterator: open FDM input failed path=%s errno=%d",
-             fdm_in_path, errno);
+    cemu_log("NewIterator: open FDM input failed errno=%d", errno);
     close(sst_fd);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
   }
-  if (ftruncate(fdm_in_fd, static_cast<off_t>(file_size)) != 0) {
-    close(fdm_in_fd); unlink(fdm_in_path); close(sst_fd);
-    return inner_->NewIterator(read_options, prefix_extractor, arena,
-                               skip_filters, caller, compaction_readahead_size,
-                               allow_unprepared_value);
-  }
+
+  // Copy SST content into FDM input file at offset 0.
   {
     char copy_buf[65536];
     off_t offset = 0;
@@ -325,31 +327,22 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
       remaining -= static_cast<size_t>(nr);
     }
     if (!copy_ok) {
-      cemu_log("NewIterator: SST→FDM copy failed at offset=%lld errno=%d",
+      cemu_log("NewIterator: SST→FDM copy failed offset=%lld errno=%d",
                (long long)offset, errno);
-      close(fdm_in_fd); unlink(fdm_in_path); close(sst_fd);
+      close(fdm_in_fd); close(sst_fd);
       return inner_->NewIterator(read_options, prefix_extractor, arena,
                                  skip_filters, caller, compaction_readahead_size,
                                  allow_unprepared_value);
     }
   }
   close(sst_fd);
-  cemu_log("NewIterator: SST copied to FDM path=%s size=%llu",
-           fdm_in_path, (unsigned long long)file_size);
+  cemu_log("NewIterator: SST staged to FDM input file size=%llu",
+           (unsigned long long)file_size);
 
-  // Create FDM output file: header (16 bytes) + up to file_size KV stream.
-  const uint64_t out_capacity = kCsfHeaderSize + file_size;
-  int fdm_out_fd = open(fdm_out_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  int fdm_out_fd = open(fdm_out_path, O_RDWR);
   if (fdm_out_fd < 0) {
     cemu_log("NewIterator: open FDM output failed errno=%d", errno);
-    close(fdm_in_fd); unlink(fdm_in_path);
-    return inner_->NewIterator(read_options, prefix_extractor, arena,
-                               skip_filters, caller, compaction_readahead_size,
-                               allow_unprepared_value);
-  }
-  if (ftruncate(fdm_out_fd, static_cast<off_t>(out_capacity)) != 0) {
-    close(fdm_out_fd); unlink(fdm_out_path);
-    close(fdm_in_fd); unlink(fdm_in_path);
+    close(fdm_in_fd);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
@@ -393,21 +386,20 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
     if (exec_ret < 0) {
       struct ioctl_create_mrs del{}; del.rsid = mrs.rsid;
       ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
-      close(fdm_out_fd); unlink(fdm_out_path);
-      close(fdm_in_fd); unlink(fdm_in_path);
+      close(fdm_out_fd);
+      close(fdm_in_fd);
       return inner_->NewIterator(read_options, prefix_extractor, arena,
                                  skip_filters, caller, compaction_readahead_size,
                                  allow_unprepared_value);
     }
   }
 
-  // Release MRS and FDM input file — no longer needed after execution.
+  // Release MRS — FDM files are permanent pool members, not deleted.
   {
     struct ioctl_create_mrs del{}; del.rsid = mrs.rsid;
     ioctl(cemu_fd_, IOCTL_CEMU_DELETE_MRS, &del);
   }
   close(fdm_in_fd);
-  unlink(fdm_in_path);
 
   // Read the 16-byte header written by mvcc_filter into the FDM output file:
   //   bytes 0-7:  result_bytes (KV stream length)
@@ -435,7 +427,6 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
     }
   }
   close(fdm_out_fd);
-  unlink(fdm_out_path);
 
   if (!result_buf && result_bytes > 0) {
     return inner_->NewIterator(read_options, prefix_extractor, arena,
