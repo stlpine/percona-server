@@ -176,44 +176,30 @@ bool CemuTableReader::EnsureCsfLoaded() {
 
     const char *func_name = "mvcc_filter";
 
-    FILE *so_file = fopen(CEMU_CSF_SO_PATH, "rb");
-    if (!so_file) {
-      cemu_log("EnsureCsfLoaded: fopen(%s) failed errno=%d", CEMU_CSF_SO_PATH, errno);
-      close(cemu_fd_);
-      cemu_fd_ = -1;
-      return;
-    }
-    fseek(so_file, 0, SEEK_END);
-    const long file_size = ftell(so_file);
-    rewind(so_file);
-
-    const size_t alloc_size =
-        (static_cast<size_t>(file_size) + 4095) & ~static_cast<size_t>(4095);
+    // FEMU's load_shared_lib interprets dl.addr as a HOST filesystem path string
+    // to dlopen() — it does not accept raw ELF bytes.  Pass the path + function
+    // name as two consecutive null-terminated strings in the buffer.
+    const size_t path_len = strlen(CEMU_CSF_SO_PATH);
+    const size_t func_len = strlen(func_name);
+    const size_t buf_size = path_len + 1 + func_len + 1;
+    const size_t alloc_size = (buf_size + 4095) & ~static_cast<size_t>(4095);
     char *prog_buf = static_cast<char *>(aligned_alloc(4096, alloc_size));
     if (!prog_buf) {
       cemu_log("EnsureCsfLoaded: aligned_alloc failed");
-      fclose(so_file);
       close(cemu_fd_);
       cemu_fd_ = -1;
       return;
     }
     memset(prog_buf, 0, alloc_size);
-    const size_t bytes_read = fread(prog_buf, 1, static_cast<size_t>(file_size), so_file);
-    fclose(so_file);
-    if (static_cast<long>(bytes_read) != file_size) {
-      cemu_log("EnsureCsfLoaded: fread returned %zu expected %ld", bytes_read, file_size);
-      free(prog_buf);
-      close(cemu_fd_);
-      cemu_fd_ = -1;
-      return;
-    }
-    cemu_log("EnsureCsfLoaded: downloading so_path=%s func=%s buf_size=%ld",
-             CEMU_CSF_SO_PATH, func_name, file_size);
+    memcpy(prog_buf, CEMU_CSF_SO_PATH, path_len + 1);
+    memcpy(prog_buf + path_len + 1, func_name, func_len + 1);
+    cemu_log("EnsureCsfLoaded: downloading so_path=%s func=%s buf_size=%zu",
+             CEMU_CSF_SO_PATH, func_name, buf_size);
 
     struct ioctl_download dl{};
     dl.name = func_name;  // required — DOWNLOAD returns EFAULT if name is null
     dl.addr = prog_buf;
-    dl.size = static_cast<int32_t>(file_size);
+    dl.size = static_cast<int32_t>(buf_size);
     dl.ptype = PROGRAM_TYPE_SHARED_LIB;
     int dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
     cemu_log("EnsureCsfLoaded: DOWNLOAD ret=%d pind=%d errno=%d", dl_ret, (int)dl.pind, errno);
@@ -229,7 +215,7 @@ bool CemuTableReader::EnsureCsfLoaded() {
       memset(&dl, 0, sizeof(dl));
       dl.name = func_name;
       dl.addr = prog_buf;
-      dl.size = static_cast<int32_t>(file_size);
+      dl.size = static_cast<int32_t>(buf_size);
       dl.ptype = PROGRAM_TYPE_SHARED_LIB;
       dl_ret = ioctl(cemu_fd_, IOCTL_CEMU_DOWNLOAD, &dl);
       cemu_log("EnsureCsfLoaded: DOWNLOAD retry ret=%d pind=%d errno=%d",
