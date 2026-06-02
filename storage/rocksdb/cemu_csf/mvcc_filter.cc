@@ -43,22 +43,18 @@
 #include <cstdio>
 #include <cstring>
 
-// cemu_csf.h is provided by the CEMU SDK inside the CEMU VM build environment.
-#ifdef HAVE_CEMU_SDK
-#include "cemu_csf.h"
-#else
-struct cemu_mr {
-  void *addr;
-  size_t len;
-};
-struct cemu_csf_args {
-  struct cemu_mr mr[8];
+// Real CEMU struct from ~/CEMU/tests/cemu/kernel/cemu_def.h
+// mr_addr[i] / mr_len[i] are arrays; cparam1 is the snapshot sequence number.
+struct cemu_args {
+  int numr;
+  void **mr_addr;
+  long long *mr_len;
   long long cparam1;
   long long cparam2;
-  uint64_t ret;
-};
-#define CEMU_CSF_ENTRY(name) extern "C" void name
-#endif
+  void *data_buffer;
+  long long buffer_len;
+} __attribute__((packed));
+#define CEMU_CSF_ENTRY(name) extern "C" long long name
 
 // ---------------------------------------------------------------------------
 // Varint helpers — no RocksDB dependency in CSF
@@ -334,31 +330,31 @@ static void process_data_block(const char *block_data, size_t block_size,
 // CSF entry point
 // ---------------------------------------------------------------------------
 
-CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
-  const char *file_data = static_cast<const char *>(args->mr[0].addr);
-  size_t file_len = args->mr[0].len;
-  char *out_buf = static_cast<char *>(args->mr[1].addr);
-  const size_t out_capacity = args->mr[1].len;
+CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
+  const char *file_data = static_cast<const char *>(args->mr_addr[0]);
+  size_t file_len = static_cast<size_t>(args->mr_len[0]);
+  char *out_buf = static_cast<char *>(args->mr_addr[1]);
+  const size_t out_capacity = static_cast<size_t>(args->mr_len[1]);
   const uint64_t snapshot_seq = static_cast<uint64_t>(args->cparam1);
 
   // Header occupies the first 16 bytes; KV stream follows.
   static const size_t kHeaderSize = 16;
   fprintf(stderr, "[mvcc_filter] entry file_len=%zu out_capacity=%zu snap=%llu\n",
           file_len, out_capacity, (unsigned long long)snapshot_seq);
-  if (out_capacity < kHeaderSize) { fprintf(stderr, "[mvcc_filter] FAIL: out_capacity\n"); return; }
+  if (out_capacity < kHeaderSize) { fprintf(stderr, "[mvcc_filter] FAIL: out_capacity\n"); return 0; }
   memset(out_buf, 0, kHeaderSize);
 
   // Locate the index block via the SST footer.
   BlockHandle index_bh;
   if (!parse_footer(file_data, file_len, &index_bh)) {
     fprintf(stderr, "[mvcc_filter] FAIL: parse_footer file_len=%zu\n", file_len);
-    return;
+    return 0;
   }
   fprintf(stderr, "[mvcc_filter] index_bh offset=%llu size=%llu\n",
           (unsigned long long)index_bh.offset, (unsigned long long)index_bh.size);
   if (index_bh.offset + index_bh.size > file_len) {
     fprintf(stderr, "[mvcc_filter] FAIL: index_bh out of range\n");
-    return;
+    return 0;
   }
 
   const char *index_data = file_data + index_bh.offset;
@@ -367,12 +363,12 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
   // Parse the index block to enumerate data block handles.
   // The index block uses the same delta-encoded format as data blocks.
   // Each entry value is a BlockHandle (two varint64s: offset, size).
-  if (index_size < 4) return;
+  if (index_size < 4) return 0;
   uint32_t idx_num_restarts;
   memcpy(&idx_num_restarts, index_data + index_size - 4, 4);
   if (idx_num_restarts == 0) idx_num_restarts = 1;
   const size_t idx_restart_bytes = (1 + idx_num_restarts) * 4;
-  if (idx_restart_bytes > index_size) return;
+  if (idx_restart_bytes > index_size) return 0;
   const char *idx_entry_end = index_data + index_size - idx_restart_bytes;
 
   FilterState st{};
@@ -424,4 +420,5 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
   const uint64_t keys_seen = st.keys_seen;
   memcpy(out_buf,     &result_bytes, 8);
   memcpy(out_buf + 8, &keys_seen,    8);
+  return 0;
 }
