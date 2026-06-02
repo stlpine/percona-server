@@ -372,6 +372,10 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
   if (idx_restart_bytes > index_size) { fprintf(stderr, "[mvcc_filter] FAIL: restart_bytes=%zu > index_size=%zu\n", idx_restart_bytes, index_size); return 0; }
   const char *idx_entry_end = index_data + index_size - idx_restart_bytes;
   fprintf(stderr, "[mvcc_filter] idx_entry_region=%zu bytes\n", (size_t)(idx_entry_end - index_data));
+  fprintf(stderr, "[mvcc_filter] index_block_hex:");
+  for (size_t i = 0; i < index_size; i++)
+    fprintf(stderr, " %02x", (unsigned char)index_data[i]);
+  fprintf(stderr, "\n");
 
   FilterState st{};
   st.out_ptr = out_buf + kHeaderSize;
