@@ -135,26 +135,17 @@ static bool parse_metaindex_for_index(const char *block_data, size_t block_size,
   if (block_size < 4) return false;
   uint32_t num_restarts;
   memcpy(&num_restarts, block_data + block_size - 4, 4);
-  fprintf(stderr, "[mvcc_filter] metaindex: block_size=%zu raw_num_restarts=%u\n",
-          block_size, num_restarts);
   if (num_restarts == 0) num_restarts = 1;
   const size_t restart_bytes = (size_t)(1 + num_restarts) * 4;
   if (restart_bytes > block_size) return false;
   const char *entry_end = block_data + block_size - restart_bytes;
 
-  fprintf(stderr, "[mvcc_filter] metaindex hex:");
-  for (size_t i = 0; i < (block_size < 128 ? block_size : 128); i++)
-    fprintf(stderr, " %02x", (unsigned char)block_data[i]);
-  fprintf(stderr, "\n");
-
   char key_buf[256];
   size_t key_buf_len = 0;
   const char *p = block_data;
-  int entry_idx = 0;
 
   while (p < entry_end) {
     uint32_t shared, non_shared, val_len;
-    const char *entry_start = p;
     p = decode_varint32(p, entry_end, &shared);
     if (!p) break;
     p = decode_varint32(p, entry_end, &non_shared);
@@ -171,23 +162,11 @@ static bool parse_metaindex_for_index(const char *block_data, size_t block_size,
     const char *val_ptr = p + non_shared;
     p = val_ptr + val_len;
 
-    fprintf(stderr, "[mvcc_filter] metaindex entry[%d] @%ld: shared=%u non_shared=%u val_len=%u key=\"%.*s\" val_hex:",
-            entry_idx++, (long)(entry_start - block_data),
-            shared, non_shared, val_len, (int)full_key_len, key_buf);
-    for (uint32_t i = 0; i < val_len; i++)
-      fprintf(stderr, " %02x", (unsigned char)val_ptr[i]);
-    fprintf(stderr, "\n");
-
     if (full_key_len == kIndexBlockKeyLen &&
         memcmp(key_buf, kIndexBlockKey, kIndexBlockKeyLen) == 0) {
-      bool ok = decode_block_handle(val_ptr, val_ptr + val_len, index_bh) != nullptr;
-      fprintf(stderr, "[mvcc_filter] metaindex: found rocksdb.index ok=%d bh={%llu,%llu}\n",
-              ok, ok?(unsigned long long)index_bh->offset:0ULL,
-              ok?(unsigned long long)index_bh->size:0ULL);
-      return ok;
+      return decode_block_handle(val_ptr, val_ptr + val_len, index_bh) != nullptr;
     }
   }
-  fprintf(stderr, "[mvcc_filter] metaindex: rocksdb.index NOT found\n");
   return false;
 }
 
@@ -360,47 +339,24 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
 
   // Header occupies the first 16 bytes; KV stream follows.
   static const size_t kHeaderSize = 16;
-  fprintf(stderr, "[mvcc_filter] entry file_len=%zu out_capacity=%zu snap=%llu\n",
-          file_len, out_capacity, (unsigned long long)snapshot_seq);
-  if (out_capacity < kHeaderSize) { fprintf(stderr, "[mvcc_filter] FAIL: out_capacity\n"); return 0; }
+  if (out_capacity < kHeaderSize) return 0;
   memset(out_buf, 0, kHeaderSize);
 
   // Locate the index block via the SST footer.
   BlockHandle index_bh;
-  if (!parse_footer(file_data, file_len, &index_bh)) {
-    fprintf(stderr, "[mvcc_filter] FAIL: parse_footer file_len=%zu\n", file_len);
-    return 0;
-  }
-  fprintf(stderr, "[mvcc_filter] index_bh offset=%llu size=%llu\n",
-          (unsigned long long)index_bh.offset, (unsigned long long)index_bh.size);
-  fprintf(stderr, "[mvcc_filter] file_start_hex:");
-  for (size_t i = 0; i < (file_len < 100 ? file_len : 100); i++)
-    fprintf(stderr, " %02x", (unsigned char)file_data[i]);
-  fprintf(stderr, "\n");
-  if (index_bh.offset + index_bh.size > file_len) {
-    fprintf(stderr, "[mvcc_filter] FAIL: index_bh out of range\n");
-    return 0;
-  }
+  if (!parse_footer(file_data, file_len, &index_bh)) return 0;
+  if (index_bh.offset + index_bh.size > file_len) return 0;
 
   const char *index_data = file_data + index_bh.offset;
   size_t index_size = index_bh.size;
 
-  // Parse the index block to enumerate data block handles.
-  // The index block uses the same delta-encoded format as data blocks.
-  // Each entry value is a BlockHandle (two varint64s: offset, size).
-  if (index_size < 4) { fprintf(stderr, "[mvcc_filter] FAIL: index_size<4\n"); return 0; }
+  if (index_size < 4) return 0;
   uint32_t idx_num_restarts;
   memcpy(&idx_num_restarts, index_data + index_size - 4, 4);
-  fprintf(stderr, "[mvcc_filter] idx_num_restarts=%u\n", idx_num_restarts);
   if (idx_num_restarts == 0) idx_num_restarts = 1;
   const size_t idx_restart_bytes = (1 + idx_num_restarts) * 4;
-  if (idx_restart_bytes > index_size) { fprintf(stderr, "[mvcc_filter] FAIL: restart_bytes=%zu > index_size=%zu\n", idx_restart_bytes, index_size); return 0; }
+  if (idx_restart_bytes > index_size) return 0;
   const char *idx_entry_end = index_data + index_size - idx_restart_bytes;
-  fprintf(stderr, "[mvcc_filter] idx_entry_region=%zu bytes\n", (size_t)(idx_entry_end - index_data));
-  fprintf(stderr, "[mvcc_filter] index_block_hex:");
-  for (size_t i = 0; i < index_size; i++)
-    fprintf(stderr, " %02x", (unsigned char)index_data[i]);
-  fprintf(stderr, "\n");
 
   FilterState st{};
   st.out_ptr = out_buf + kHeaderSize;
@@ -433,20 +389,14 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
 
     BlockHandle data_bh;
     const char *p2 = decode_varint64(p, idx_entry_end, &data_bh.offset);
-    if (!p2) { fprintf(stderr, "[mvcc_filter] data_bh offset decode failed\n"); break; }
+    if (!p2) break;
     p = decode_varint64(p2, idx_entry_end, &data_bh.size);
-    if (!p) { fprintf(stderr, "[mvcc_filter] data_bh size decode failed\n"); break; }
-    fprintf(stderr, "[mvcc_filter] data_bh offset=%llu size=%llu\n",
-            (unsigned long long)data_bh.offset, (unsigned long long)data_bh.size);
+    if (!p) break;
 
-    if (data_bh.offset + data_bh.size > file_len) {
-      fprintf(stderr, "[mvcc_filter] data_bh out of range\n"); continue;
-    }
+    if (data_bh.offset + data_bh.size > file_len) continue;
 
     process_data_block(file_data + data_bh.offset, data_bh.size, snapshot_seq,
                        &st);
-    fprintf(stderr, "[mvcc_filter] after data block: keys_seen=%llu\n",
-            (unsigned long long)st.keys_seen);
   }
 
   // Write the 16-byte header: result_bytes (8) + keys_seen (8).
