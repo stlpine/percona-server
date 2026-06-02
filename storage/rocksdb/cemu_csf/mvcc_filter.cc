@@ -411,36 +411,31 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
   char idx_key_buf[32768];
   size_t idx_key_buf_len = 0;
 
+  // Index entries in Percona Server format_version=6 omit the val_len field.
+  // Format: [shared_varint][non_shared_varint][key_delta(non_shared bytes)]
+  //         [bh.offset_varint][bh.size_varint]
   const char *p = index_data;
   while (p < idx_entry_end && !st.overflow) {
-    uint32_t shared, non_shared, val_len;
+    uint32_t shared, non_shared;
 
     p = decode_varint32(p, idx_entry_end, &shared);
     if (!p) break;
     p = decode_varint32(p, idx_entry_end, &non_shared);
     if (!p) break;
-    p = decode_varint32(p, idx_entry_end, &val_len);
-    if (!p) break;
 
-    if (static_cast<size_t>(idx_entry_end - p) < non_shared + val_len) break;
+    if (static_cast<size_t>(idx_entry_end - p) < non_shared) break;
 
     const size_t full_key_len = shared + non_shared;
     if (full_key_len > sizeof(idx_key_buf) || shared > idx_key_buf_len) break;
     memcpy(idx_key_buf + shared, p, non_shared);
     idx_key_buf_len = full_key_len;
-
-    const char *val_ptr = p + non_shared;
-    p = val_ptr + val_len;
+    p += non_shared;
 
     BlockHandle data_bh;
-    if (!decode_block_handle(val_ptr, val_ptr + val_len, &data_bh)) {
-      fprintf(stderr, "[mvcc_filter] data_bh decode failed: shared=%u non_shared=%u val_len=%u key_hex:",
-              shared, non_shared, val_len);
-      for (size_t i = 0; i < (full_key_len < 32 ? full_key_len : 32); i++)
-        fprintf(stderr, " %02x", (unsigned char)idx_key_buf[i]);
-      fprintf(stderr, "\n");
-      continue;
-    }
+    const char *p2 = decode_varint64(p, idx_entry_end, &data_bh.offset);
+    if (!p2) { fprintf(stderr, "[mvcc_filter] data_bh offset decode failed\n"); break; }
+    p = decode_varint64(p2, idx_entry_end, &data_bh.size);
+    if (!p) { fprintf(stderr, "[mvcc_filter] data_bh size decode failed\n"); break; }
     fprintf(stderr, "[mvcc_filter] data_bh offset=%llu size=%llu\n",
             (unsigned long long)data_bh.offset, (unsigned long long)data_bh.size);
 
