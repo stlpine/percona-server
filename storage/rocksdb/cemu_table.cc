@@ -426,32 +426,38 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   }
   close(fdm_in_fd);
 
-  // Read the 16-byte header written by mvcc_filter into the FDM output file:
-  //   bytes 0-7:  result_bytes (KV stream length)
-  //   bytes 8-15: keys_seen
-  char hdr[kCsfHeaderSize] = {};
+  // Read the CSF output from the FDM file.
+  // FDMFS requires 4096-aligned buffer pointer, size, and offset (DIO).
+  // Two separate small preads (header then KV stream) would both fail because
+  // neither the 16-byte size nor the 16-byte offset is 4096-aligned.
+  // Read the whole output in one aligned pread, then copy out what we need.
+  const size_t aligned_out_cap =
+      (out_capacity + 4095) & ~static_cast<size_t>(4095);
+  char *out_buf =
+      static_cast<char *>(aligned_alloc(4096, aligned_out_cap));
   uint64_t result_bytes = 0;
   uint64_t keys_seen    = 0;
-  if (pread(fdm_out_fd, hdr, kCsfHeaderSize, 0) ==
-      static_cast<ssize_t>(kCsfHeaderSize)) {
-    memcpy(&result_bytes, hdr,     8);
-    memcpy(&keys_seen,    hdr + 8, 8);
-  }
-  cemu_log("NewIterator: result_bytes=%llu keys_seen=%llu",
-           (unsigned long long)result_bytes, (unsigned long long)keys_seen);
-
-  // Read the KV stream that follows the header.
   char *result_buf = nullptr;
-  if (result_bytes > 0) {
-    result_buf = new char[result_bytes];
-    if (pread(fdm_out_fd, result_buf, result_bytes,
-              static_cast<off_t>(kCsfHeaderSize)) !=
-        static_cast<ssize_t>(result_bytes)) {
-      delete[] result_buf;
-      result_buf = nullptr;
+  if (out_buf) {
+    memset(out_buf, 0, aligned_out_cap);
+    ssize_t nr = pread(fdm_out_fd, out_buf, aligned_out_cap, 0);
+    cemu_log("NewIterator: output pread nr=%zd aligned=%zu errno=%d",
+             nr, aligned_out_cap, errno);
+    if (nr == static_cast<ssize_t>(aligned_out_cap)) {
+      memcpy(&result_bytes, out_buf,     8);
+      memcpy(&keys_seen,    out_buf + 8, 8);
+      if (result_bytes > 0 &&
+          kCsfHeaderSize + result_bytes <= static_cast<uint64_t>(nr)) {
+        result_buf = new char[result_bytes];
+        if (result_buf)
+          memcpy(result_buf, out_buf + kCsfHeaderSize, result_bytes);
+      }
     }
+    free(out_buf);
   }
   close(fdm_out_fd);
+  cemu_log("NewIterator: result_bytes=%llu keys_seen=%llu",
+           (unsigned long long)result_bytes, (unsigned long long)keys_seen);
 
   if (!result_buf && result_bytes > 0) {
     return inner_->NewIterator(read_options, prefix_extractor, arena,
