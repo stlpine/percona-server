@@ -40,6 +40,7 @@
 //       -o mvcc_filter.so mvcc_filter.cc
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 // cemu_csf.h is provided by the CEMU SDK inside the CEMU VM build environment.
@@ -342,13 +343,23 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_csf_args *args) {
 
   // Header occupies the first 16 bytes; KV stream follows.
   static const size_t kHeaderSize = 16;
-  if (out_capacity < kHeaderSize) return;
+  fprintf(stderr, "[mvcc_filter] entry file_len=%zu out_capacity=%zu snap=%llu\n",
+          file_len, out_capacity, (unsigned long long)snapshot_seq);
+  if (out_capacity < kHeaderSize) { fprintf(stderr, "[mvcc_filter] FAIL: out_capacity\n"); return; }
   memset(out_buf, 0, kHeaderSize);
 
   // Locate the index block via the SST footer.
   BlockHandle index_bh;
-  if (!parse_footer(file_data, file_len, &index_bh)) return;
-  if (index_bh.offset + index_bh.size > file_len) return;
+  if (!parse_footer(file_data, file_len, &index_bh)) {
+    fprintf(stderr, "[mvcc_filter] FAIL: parse_footer file_len=%zu\n", file_len);
+    return;
+  }
+  fprintf(stderr, "[mvcc_filter] index_bh offset=%llu size=%llu\n",
+          (unsigned long long)index_bh.offset, (unsigned long long)index_bh.size);
+  if (index_bh.offset + index_bh.size > file_len) {
+    fprintf(stderr, "[mvcc_filter] FAIL: index_bh out of range\n");
+    return;
+  }
 
   const char *index_data = file_data + index_bh.offset;
   size_t index_size = index_bh.size;
