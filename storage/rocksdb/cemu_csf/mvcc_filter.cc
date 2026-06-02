@@ -363,13 +363,15 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
   // Parse the index block to enumerate data block handles.
   // The index block uses the same delta-encoded format as data blocks.
   // Each entry value is a BlockHandle (two varint64s: offset, size).
-  if (index_size < 4) return 0;
+  if (index_size < 4) { fprintf(stderr, "[mvcc_filter] FAIL: index_size<4\n"); return 0; }
   uint32_t idx_num_restarts;
   memcpy(&idx_num_restarts, index_data + index_size - 4, 4);
+  fprintf(stderr, "[mvcc_filter] idx_num_restarts=%u\n", idx_num_restarts);
   if (idx_num_restarts == 0) idx_num_restarts = 1;
   const size_t idx_restart_bytes = (1 + idx_num_restarts) * 4;
-  if (idx_restart_bytes > index_size) return 0;
+  if (idx_restart_bytes > index_size) { fprintf(stderr, "[mvcc_filter] FAIL: restart_bytes=%zu > index_size=%zu\n", idx_restart_bytes, index_size); return 0; }
   const char *idx_entry_end = index_data + index_size - idx_restart_bytes;
+  fprintf(stderr, "[mvcc_filter] idx_entry_region=%zu bytes\n", (size_t)(idx_entry_end - index_data));
 
   FilterState st{};
   st.out_ptr = out_buf + kHeaderSize;
@@ -402,14 +404,20 @@ CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
     p = val_ptr + val_len;
 
     BlockHandle data_bh;
-    if (!decode_block_handle(val_ptr, val_ptr + val_len, &data_bh)) continue;
+    if (!decode_block_handle(val_ptr, val_ptr + val_len, &data_bh)) {
+      fprintf(stderr, "[mvcc_filter] data_bh decode failed\n"); continue;
+    }
+    fprintf(stderr, "[mvcc_filter] data_bh offset=%llu size=%llu\n",
+            (unsigned long long)data_bh.offset, (unsigned long long)data_bh.size);
 
-    // Block handle size does not include the 5-byte block trailer; the data
-    // block content is exactly data_bh.size bytes starting at data_bh.offset.
-    if (data_bh.offset + data_bh.size > file_len) continue;
+    if (data_bh.offset + data_bh.size > file_len) {
+      fprintf(stderr, "[mvcc_filter] data_bh out of range\n"); continue;
+    }
 
     process_data_block(file_data + data_bh.offset, data_bh.size, snapshot_seq,
                        &st);
+    fprintf(stderr, "[mvcc_filter] after data block: keys_seen=%llu\n",
+            (unsigned long long)st.keys_seen);
   }
 
   // Write the 16-byte header: result_bytes (8) + keys_seen (8).
