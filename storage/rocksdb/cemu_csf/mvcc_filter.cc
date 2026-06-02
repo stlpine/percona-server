@@ -171,8 +171,8 @@ static bool parse_metaindex_for_index(const char *block_data, size_t block_size,
     const char *val_ptr = p + non_shared;
     p = val_ptr + val_len;
 
-    fprintf(stderr, "[mvcc_filter] metaindex entry[%d] @%td: shared=%u non_shared=%u val_len=%u key=\"%.*s\" val_hex:",
-            entry_idx++, (ptrdiff_t)(entry_start - block_data),
+    fprintf(stderr, "[mvcc_filter] metaindex entry[%d] @%ld: shared=%u non_shared=%u val_len=%u key=\"%.*s\" val_hex:",
+            entry_idx++, (long)(entry_start - block_data),
             shared, non_shared, val_len, (int)full_key_len, key_buf);
     for (uint32_t i = 0; i < val_len; i++)
       fprintf(stderr, " %02x", (unsigned char)val_ptr[i]);
