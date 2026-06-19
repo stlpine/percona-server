@@ -27,6 +27,7 @@
 namespace myrocks {
 extern std::atomic<uint64_t> rocksdb_cemu_keys_seen;
 extern std::atomic<uint64_t> rocksdb_cemu_keys_filtered;
+extern std::atomic<uint64_t> rocksdb_cemu_freeze_ns;
 }  // namespace myrocks
 
 // CemuResultIterator walks the flat KV stream produced by the mvcc_filter CSF

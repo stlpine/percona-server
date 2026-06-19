@@ -68,6 +68,7 @@ static_assert(sizeof(nvme_program_execute_cmd) == 64,
 #include <cstring>
 #include <mutex>
 #include <stdio.h>
+#include <time.h>
 
 // Temporary debug logger — writes to /tmp/cemu_debug.log.
 // Remove before production use.
@@ -119,6 +120,7 @@ namespace myrocks {
 // Definitions live in ha_rocksdb.cc; declared extern in cemu_iterator.h.
 extern std::atomic<uint64_t> rocksdb_cemu_keys_seen;
 extern std::atomic<uint64_t> rocksdb_cemu_keys_filtered;
+extern std::atomic<uint64_t> rocksdb_cemu_freeze_ns;
 extern bool rocksdb_cemu_enabled;
 
 }  // namespace myrocks
@@ -406,7 +408,19 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
     exec->cparam1 = static_cast<uint64_t>(snap_seq);
     cemu_log("NewIterator: EXECUTE pind=%d rsid=%d snap_seq=%llu",
              (int)pind_, (int)mrs.rsid, (unsigned long long)snap_seq);
+    struct timespec _t0, _t1;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
     const int exec_ret = ioctl(ng_fd_, NVME_IOCTL_IO_CMD, &nvme_cmd);
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    const uint64_t freeze_ns =
+        (uint64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000000ULL +
+        (uint64_t)(_t1.tv_nsec - _t0.tv_nsec);
+    cemu_log("FREEZE file_number=%llu file_size=%llu freeze_ns=%llu",
+             (unsigned long long)file_number_,
+             (unsigned long long)file_size,
+             (unsigned long long)freeze_ns);
+    myrocks::rocksdb_cemu_freeze_ns.fetch_add(freeze_ns,
+                                              std::memory_order_relaxed);
     cemu_log("NewIterator: EXECUTE ret=%d errno=%d", exec_ret, errno);
     if (exec_ret < 0) {
       struct ioctl_create_mrs del{}; del.rsid = mrs.rsid;
