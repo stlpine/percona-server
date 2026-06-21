@@ -376,21 +376,19 @@ bool Rdb_cf_options::get_cf_options(const std::string &cf_name,
             opts->comparator, opts->num_levels,
             Rdb_cf_manager::is_cf_name_reverse(cf_name));
   }
-  // CemuTableFactory: wrap table factory for CFs whose name starts with "csd_"
-  // so that user-facing scans on those CFs offload MVCC filtering to the
-  // emulated CSD compute unit. Only active when rocksdb_cemu_enabled=ON and
-  // the binary was built with -DHAVE_CEMU.
-  //
-  // The prefix check restricts CEMU to CFs explicitly designated for
-  // CSD-offloaded OLAP access. OLTP CFs (default, __system__, etc.) are
-  // intentionally excluded — they have short scan distances where the
-  // CSD round-trip would add latency rather than save host CPU.
+  // CemuTableFactory: unconditionally wrap the table factory for any CF whose
+  // name starts with "csd_". The wrapping must happen here at DB::Open() time,
+  // before rocksdb_cemu_enabled has been applied from the config file (plugin
+  // sysvars are initialized after ha_rocksdb_init() returns, so the sysvar is
+  // still at its default false value when this function runs). The runtime
+  // check in CemuTableReader::NewIterator() gates actual CEMU execution:
+  // when rocksdb_cemu_enabled=OFF, NewIterator() falls back to the inner
+  // BlockBasedTableReader transparently.
   //
   // cf_opts.compression = kNoCompression is required: the CSF reads raw block
   // bytes from the NVM namespace and cannot decompress on-device. This must
   // be set before any data is written to the CF.
-  if (rocksdb_cemu_enabled && cf_name.size() >= 4 &&
-      cf_name.substr(0, 4) == "csd_") {
+  if (cf_name.size() >= 4 && cf_name.substr(0, 4) == "csd_") {
     opts->table_factory =
         std::make_shared<CemuTableFactory>(opts->table_factory);
     opts->compression = rocksdb::kNoCompression;
