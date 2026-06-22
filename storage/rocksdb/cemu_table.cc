@@ -321,6 +321,17 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   const uint64_t file_size = static_cast<uint64_t>(sst_st.st_size);
   const uint64_t out_capacity = kCsfHeaderSize + file_size;
 
+  // FDMFS pre-allocated files are 32 MB each; skip larger SSTs.
+  static const uint64_t kFdmMaxSize = 32ULL * 1024 * 1024;
+  if (file_size > kFdmMaxSize) {
+    cemu_log("NewIterator: SST too large (%llu > 32MB), fallback",
+             (unsigned long long)file_size);
+    close(sst_fd);
+    return inner_->NewIterator(read_options, prefix_extractor, arena,
+                               skip_filters, caller, compaction_readahead_size,
+                               allow_unprepared_value);
+  }
+
   // Use pre-existing FDMFS files — FDMFS does not support writes to
   // dynamically created files (kernel NULL deref in fdmfs_iomap_begin).
   // Files 0 and 1 are pre-allocated at mount time (32 MB each).
@@ -407,6 +418,7 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
     exec->pind    = static_cast<uint16_t>(pind_);
     exec->rsid    = mrs.rsid;
     exec->cparam1 = static_cast<uint64_t>(snap_seq);
+    exec->cparam2 = static_cast<uint64_t>(file_size);  // actual (unaligned) size for CSF footer parsing
     cemu_log("NewIterator: EXECUTE pind=%d rsid=%d snap_seq=%llu",
              (int)pind_, (int)mrs.rsid, (unsigned long long)snap_seq);
     struct timespec _t0, _t1;

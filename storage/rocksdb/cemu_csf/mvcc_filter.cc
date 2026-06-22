@@ -332,7 +332,11 @@ static void process_data_block(const char *block_data, size_t block_size,
 
 CEMU_CSF_ENTRY(mvcc_filter)(struct cemu_args *args) {
   const char *file_data = static_cast<const char *>(args->mr_addr[0]);
-  size_t file_len = static_cast<size_t>(args->mr_len[0]);
+  // cparam2 carries the actual (unaligned) SST byte count set by CemuTableReader.
+  // mr_len[0] is the 4096-aligned size used for FDMFS DIO; the real footer sits
+  // at file_data + cparam2 - kFooterSize, not at file_data + mr_len[0] - kFooterSize.
+  size_t file_len = (args->cparam2 > 0) ? static_cast<size_t>(args->cparam2)
+                                        : static_cast<size_t>(args->mr_len[0]);
   char *out_buf = static_cast<char *>(args->mr_addr[1]);
   const size_t out_capacity = static_cast<size_t>(args->mr_len[1]);
   const uint64_t snapshot_seq = static_cast<uint64_t>(args->cparam1);
