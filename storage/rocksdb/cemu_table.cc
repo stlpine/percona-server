@@ -378,8 +378,9 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   // CREATE_MRS: mr[0]=FDM input (SST copy), mr[1]=FDM output.
   int       mrs_fds[2]   = { fdm_in_fd, fdm_out_fd };
   long long mrs_offs[2]  = { 0, 0 };
-  long long mrs_sizes[2] = { static_cast<long long>(file_size),
-                              static_cast<long long>(out_capacity) };
+  long long mrs_sizes[2] = {
+      static_cast<long long>((file_size    + 4095) & ~static_cast<uint64_t>(4095)),
+      static_cast<long long>((out_capacity + 4095) & ~static_cast<uint64_t>(4095)) };
   struct ioctl_create_mrs mrs{};
   mrs.nr_fd = 2;
   mrs.fd    = mrs_fds;
@@ -387,8 +388,8 @@ rocksdb::InternalIterator *CemuTableReader::NewIterator(
   mrs.size  = mrs_sizes;
   if (ioctl(cemu_fd_, IOCTL_CEMU_CREATE_MRS, &mrs) < 0) {
     cemu_log("NewIterator: CREATE_MRS failed errno=%d", errno);
-    close(fdm_out_fd); unlink(fdm_out_path);
-    close(fdm_in_fd); unlink(fdm_in_path);
+    close(fdm_out_fd);
+    close(fdm_in_fd);
     return inner_->NewIterator(read_options, prefix_extractor, arena,
                                skip_filters, caller, compaction_readahead_size,
                                allow_unprepared_value);
