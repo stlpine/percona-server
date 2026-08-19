@@ -17,6 +17,9 @@
 #include "./rdb_iterator.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdarg>
+#include <cstdio>
 
 /* MySQL includes */
 #include "scope_guard.h"
@@ -24,6 +27,38 @@
 #include "sql/thr_malloc.h"
 
 namespace myrocks {
+
+// Temporary diagnostic instrumentation: traces how often
+// setup_scan_iterator() actually creates or recreates a RocksDB iterator
+// (the two branches below), as opposed to reusing an existing one (the
+// common, cheap case, which logs nothing). Used to investigate scans that
+// take far longer than expected. FILE* opened once (function-local static)
+// and never fclose'd -- this is a hot path and per-call fopen/fclose would
+// itself distort the timing being measured; relies on normal process-exit
+// flushing via a clean mysqld shutdown. Every line is stamped with a
+// wall-clock millisecond timestamp so the *rate* of iterator recreation
+// during a single long-running query can be examined, not just the total
+// count. Remove once the investigation is done.
+namespace {
+FILE *rdb_iterator_debug_file() {
+  static FILE *f = fopen("/tmp/rdb_iterator_debug.log", "a");
+  return f;
+}
+unsigned long long rdb_iterator_debug_now_ms() {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch())
+      .count();
+}
+void rdb_iterator_debug_log(const char *fmt, ...) {
+  FILE *f = rdb_iterator_debug_file();
+  if (f == nullptr) return;
+  fprintf(f, "ts_ms=%llu ", rdb_iterator_debug_now_ms());
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(f, fmt, args);
+  va_end(args);
+}
+}  // namespace
 
 Rdb_iterator::~Rdb_iterator() {}
 
@@ -122,6 +157,21 @@ void Rdb_iterator_base::setup_scan_iterator(
   assert(slice != nullptr);
   assert(slice->size() >= eq_cond_len);
 
+  // Unconditional call-count log: the two branches below (release/create)
+  // only fire on a bloom-condition change or a null m_scan_it -- the common
+  // "SQL layer called rnd_init() again, silently reuse+reposition the
+  // existing iterator" case (see the comment a few lines down) hits
+  // neither, so it was invisible to this log until now. had_existing_it
+  // records m_scan_it's state at entry, before anything below can change
+  // it, so total_calls - creates - releases-with-a-create-following can be
+  // cross-checked against "how many times was this called with an iterator
+  // already open."
+  rdb_iterator_debug_log(
+      "call cf=%s index=%s index_number=%u thd=%lu had_existing_it=%d\n",
+      m_kd.get_cf()->GetName().c_str(), m_kd.get_name().c_str(),
+      m_kd.get_index_number(), (unsigned long)m_thd->thread_id(),
+      m_scan_it != nullptr ? 1 : 0);
+
   bool skip_bloom = true;
 
   const rocksdb::Slice eq_cond(slice->data(), eq_cond_len);
@@ -159,6 +209,10 @@ void Rdb_iterator_base::setup_scan_iterator(
     re-create Iterator.
     */
   if (m_scan_it_skips_bloom != skip_bloom) {
+    rdb_iterator_debug_log(
+        "release cf=%s index=%s index_number=%u thd=%lu reason=bloom_change\n",
+        m_kd.get_cf()->GetName().c_str(), m_kd.get_name().c_str(),
+        m_kd.get_index_number(), (unsigned long)m_thd->thread_id());
     release_scan_iterator();
   }
 
@@ -167,6 +221,10 @@ void Rdb_iterator_base::setup_scan_iterator(
     In that case, re-use the iterator, but re-position it at the table start.
     */
   if (!m_scan_it) {
+    rdb_iterator_debug_log(
+        "create cf=%s index=%s index_number=%u thd=%lu\n",
+        m_kd.get_cf()->GetName().c_str(), m_kd.get_name().c_str(),
+        m_kd.get_index_number(), (unsigned long)m_thd->thread_id());
     m_scan_it = rdb_tx_get_iterator(
         m_thd, m_kd.get_cf(), skip_bloom, m_scan_it_lower_bound_slice,
         m_scan_it_upper_bound_slice, &m_scan_it_snapshot, read_current,

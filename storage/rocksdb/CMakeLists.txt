@@ -275,6 +275,7 @@ SET(ROCKSDB_SE_SOURCES
   rdb_sst_partitioner_factory.h
   rdb_cf_options.cc rdb_cf_options.h
   rdb_cf_manager.cc rdb_cf_manager.h
+  nvmevirt_table.cc nvmevirt_table.h nvmevirt_iterator.h
   rdb_converter.cc rdb_converter.h
   properties_collector.cc properties_collector.h
   event_listener.cc event_listener.h
@@ -311,6 +312,28 @@ IF (WITH_LIBURING)
   ADD_DEFINITIONS(-DROCKSDB_IOURING_PRESENT)
 ENDIF()
 
+# NVMeVirt CSD MVCC-filter offload (naive v1 baseline). Off by default --
+# pass -DWITH_NVMEVIRT=<path to the NVMeVirt CSD source tree> to enable.
+# Consumes libCSDVirt.so from that tree via a plain -I/-l pair.
+SET(WITH_NVMEVIRT "OFF" CACHE STRING "Path to the NVMeVirt CSD source tree, to enable the CSD MVCC-filter offload.")
+IF (WITH_NVMEVIRT)
+  ADD_DEFINITIONS(-DHAVE_NVMEVIRT)
+  INCLUDE_DIRECTORIES(
+    ${WITH_NVMEVIRT}/src
+    ${WITH_NVMEVIRT}/src/lib
+  )
+  FIND_LIBRARY(NVMEVIRT_CSDVIRT_LIBRARY
+    NAMES CSDVirt
+    HINTS ${WITH_NVMEVIRT}/src/lib)
+  IF (NOT NVMEVIRT_CSDVIRT_LIBRARY)
+    MESSAGE(SEND_ERROR "WITH_NVMEVIRT=${WITH_NVMEVIRT} set but libCSDVirt.so "
+      "was not found under ${WITH_NVMEVIRT}/src/lib -- build it first "
+      "(src/lib/build.sh there) before configuring with WITH_NVMEVIRT.")
+  ENDIF()
+  SET(rocksdb_static_libs ${rocksdb_static_libs} ${NVMEVIRT_CSDVIRT_LIBRARY})
+  MESSAGE(STATUS "MyRocks: building with NVMeVirt CSD offload, source tree = ${WITH_NVMEVIRT}")
+ENDIF()
+
 SET(rocksdb_static_libs ${rocksdb_static_libs} ext::zlib ext::zstd ext::lz4 extra::rapidjson "-ldl")
 IF(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
   SET(rocksdb_static_libs ${rocksdb_static_libs} "-lrt")
@@ -320,8 +343,22 @@ ADD_LIBRARY(rocksdb_sources ${ROCKSDB_LIB_SOURCES})
 TARGET_LINK_LIBRARIES(rocksdb_sources ${rocksdb_static_libs})
 
 IF (ROCKSDB_DYNAMIC_PLUGIN)
+  # Force whole-archive inclusion of rocksdb_sources: MYSQL_ADD_PLUGIN's
+  # MODULE_ONLY path does a plain TARGET_LINK_LIBRARIES with no
+  # whole-archive/force-undefined handling (see cmake/plugin.cmake), so any
+  # object file in this static lib that's only reachable via a base-class
+  # vtable slot (not a direct compile-time call anywhere in
+  # ROCKSDB_SE_SOURCES) can get silently dropped from the final .so. Static
+  # link succeeds either way (no direct undefined reference), but dlopen()
+  # fails at runtime with "undefined symbol" once something actually needs
+  # that vtable slot resolved -- hit via NvmeVirtTableFactory (a new
+  # Customizable-derived TableFactory subclass) needing
+  # rocksdb::Customizable::GetOption, defined in options/customizable.cc,
+  # which nothing else in MyRocks's existing glue code happened to pull in
+  # before. Requires CMake >= 3.24 for $<LINK_LIBRARY:...>; confirmed 3.28
+  # on the sandbox guest.
   MYSQL_ADD_PLUGIN(rocksdb ${ROCKSDB_SE_SOURCES} STORAGE_ENGINE DEFAULT
-    MODULE_ONLY LINK_LIBRARIES rocksdb_sources)
+    MODULE_ONLY LINK_LIBRARIES "$<LINK_LIBRARY:WHOLE_ARCHIVE,rocksdb_sources>")
 ELSE()
   MYSQL_ADD_PLUGIN(rocksdb_se ${ROCKSDB_SE_SOURCES} STORAGE_ENGINE MANDATORY
     STATIC_ONLY LINK_LIBRARIES rocksdb_sources)

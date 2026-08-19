@@ -89,6 +89,8 @@
 #include "./ha_rocksdb_proto.h"
 #include "./ha_rockspart.h"
 #include "./logger.h"
+#include "./nvmevirt_iterator.h"
+#include "./nvmevirt_table.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_cf_options.h"
 #include "./rdb_converter.h"
@@ -793,6 +795,20 @@ static bool rocksdb_enable_bulk_load_api = true;
 static bool rocksdb_enable_remove_orphaned_dropped_cfs = true;
 static bool rpl_skip_tx_api_var = false;
 static bool rocksdb_enable_udt_in_mem = false;
+// Not `static` -- read cross-translation-unit from NvmeVirtTableReader::
+// NewIterator() in nvmevirt_table.cc (extern-declared in nvmevirt_table.h).
+// Naive v1 CSD-offload baseline.
+bool rocksdb_nvmevirt_enabled = false;
+// Not `static`, same reason as above. Bounds the SST size the offload will
+// attempt: the whole file is loaded into one SLM allocation with no
+// chunking, and a second, ~2x-larger SLM allocation holds the filtered
+// output -- both live at once, serialized by g_nvmevirt_exec_mutex, so this
+// should stay well under (deployed SLM capacity) / 3. Default (256MB) is
+// sized off a 4GB SLM region; retune per-deployment via
+// `SET GLOBAL rocksdb_nvmevirt_max_sst_bytes`, no rebuild required.
+/* Use unsigned long long instead of uint64_t because of MySQL compatibility */
+unsigned long long  // NOLINT(runtime/int)
+    rocksdb_nvmevirt_max_sst_bytes = 256ULL * 1024 * 1024;
 static bool rocksdb_print_snapshot_conflict_queries = false;
 static bool rocksdb_allow_to_start_after_corruption = false;
 static ulong rocksdb_write_policy = rocksdb::TxnDBWritePolicy::WRITE_COMMITTED;
@@ -846,6 +862,11 @@ enum file_checksums_type {
 };
 static ulong rocksdb_file_checksums = file_checksums_type::CHECKSUMS_OFF;
 
+// Not `static` -- read/incremented cross-translation-unit from
+// NvmeVirtResultIterator's destructor in nvmevirt_iterator.h (extern-declared
+// there). Naive v1 CSD-offload baseline.
+std::atomic<uint64_t> rocksdb_nvmevirt_keys_seen(0);
+std::atomic<uint64_t> rocksdb_nvmevirt_keys_filtered(0);
 static std::atomic<uint64_t> rocksdb_row_lock_deadlocks(0);
 static std::atomic<uint64_t> rocksdb_row_lock_wait_timeouts(0);
 static std::atomic<uint64_t> rocksdb_snapshot_conflict_errors(0);
@@ -1316,6 +1337,51 @@ static MYSQL_SYSVAR_BOOL(enable_udt_in_mem, rocksdb_enable_udt_in_mem,
                          "Enabled user define timestamp in memtable feature to "
                          "support HLC snapshot reads in MyRocks",
                          nullptr, nullptr, rocksdb_enable_udt_in_mem);
+
+static MYSQL_SYSVAR_BOOL(
+    nvmevirt_enabled, rocksdb_nvmevirt_enabled, PLUGIN_VAR_RQCMDARG,
+    "Enable MVCC filter pushdown via a NVMeVirt emulated CSD for "
+    "user-facing forward scans on column families whose name begins with "
+    "'nvmevirt_'. Naive v1 baseline: filters one SST file at a time; "
+    "cross-file/cross-level correctness still relies on RocksDB's own "
+    "unmodified MergingIterator/DBIter.",
+    nullptr, nullptr, false);
+
+static MYSQL_SYSVAR_ULONGLONG(
+    nvmevirt_max_sst_bytes, rocksdb_nvmevirt_max_sst_bytes,
+    PLUGIN_VAR_RQCMDARG,
+    "Largest SST file the NVMeVirt MVCC-filter offload will attempt; "
+    "larger files fall back to the unfiltered reader. The offload loads the "
+    "whole file into one SLM allocation plus a second, ~2x-larger SLM "
+    "allocation for the filtered output, both live at once under "
+    "g_nvmevirt_exec_mutex -- keep this at roughly 1/3 of the emulated "
+    "device's configured SLM capacity (nvmev.ko's `slm_size=` insmod "
+    "parameter) or less, and prefer a power of two to avoid the SLM buddy "
+    "allocator rounding a request up.",
+    nullptr, nullptr, /* default */ 256ULL * 1024 * 1024,
+    /* min */ 0ULL, /* max */ UINT64_MAX, 0);
+
+static MYSQL_THDVAR_BOOL(
+    nvmevirt_olap_session, PLUGIN_VAR_RQCMDARG,
+    "v2 caller restriction: mark THIS session's user-facing forward scans as "
+    "eligible for NVMeVirt MVCC-filter offload. rocksdb_nvmevirt_enabled "
+    "(GLOBAL) is still required too -- this session flag narrows eligibility "
+    "further, from 'every session's iterators' down to 'only sessions that "
+    "opt in', so a benchmark harness can SET SESSION this on its OLAP "
+    "connection only and leave concurrent OLTP connections at the default "
+    "(off), keeping their scans off the offload path and off "
+    "g_nvmevirt_exec_mutex entirely.",
+    nullptr, nullptr, false);
+
+// Cross-translation-unit accessor for the THDVAR above -- THDVAR()'s own
+// macro expansion references mysql_sysvar_nvmevirt_olap_session by name, so
+// this must be defined after (not before) the MYSQL_THDVAR_BOOL() call just
+// above that declares it. Called from NvmeVirtTableReader::NewIterator() in
+// nvmevirt_table.cc (extern-declared in nvmevirt_table.h) -- the v2
+// caller-restriction check.
+bool rdb_nvmevirt_olap_session(THD *const thd) {
+  return THDVAR(thd, nvmevirt_olap_session);
+}
 
 static MYSQL_THDVAR_STR(tmpdir, PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
                         "Directory for temporary files during DDL operations.",
@@ -2734,6 +2800,9 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(enable_bulk_load_api),
     MYSQL_SYSVAR(enable_pipelined_write),
     MYSQL_SYSVAR(enable_remove_orphaned_dropped_cfs),
+    MYSQL_SYSVAR(nvmevirt_enabled),
+    MYSQL_SYSVAR(nvmevirt_max_sst_bytes),
+    MYSQL_SYSVAR(nvmevirt_olap_session),
     MYSQL_SYSVAR(enable_udt_in_mem),
     MYSQL_SYSVAR(tmpdir),
     MYSQL_SYSVAR(merge_combine_read_size),
@@ -15630,6 +15699,10 @@ static SHOW_VAR rocksdb_status_vars[] = {
     DEF_STATUS_VAR(number_superversion_acquires),
     DEF_STATUS_VAR(number_superversion_releases),
     DEF_STATUS_VAR(number_superversion_cleanups),
+    DEF_STATUS_VAR_PTR("nvmevirt_keys_seen", &rocksdb_nvmevirt_keys_seen,
+                       SHOW_LONGLONG),
+    DEF_STATUS_VAR_PTR("nvmevirt_keys_filtered",
+                       &rocksdb_nvmevirt_keys_filtered, SHOW_LONGLONG),
     DEF_STATUS_VAR_PTR("row_lock_deadlocks", &rocksdb_row_lock_deadlocks,
                        SHOW_LONGLONG),
     DEF_STATUS_VAR_PTR("row_lock_wait_timeouts",

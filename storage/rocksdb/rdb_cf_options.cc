@@ -28,9 +28,14 @@
 #include "rocksdb/utilities/options_util.h"
 
 /* MyRocks header files */
+#include "./nvmevirt_table.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_compact_filter.h"
 #include "./rdb_sst_partitioner_factory.h"
+
+// Column families whose name starts with this prefix get their table_factory
+// wrapped with NvmeVirtTableFactory (see get_cf_options() below).
+static const std::string NVMEVIRT_CF_NAME_PREFIX = "nvmevirt_";
 
 namespace myrocks {
 
@@ -354,6 +359,21 @@ bool Rdb_cf_options::get_cf_options(const std::string &cf_name,
   // Set the comparator according to 'rev:'
   opts->comparator = get_cf_comparator(cf_name);
   opts->merge_operator = get_cf_merge_operator(cf_name);
+
+  // Wrap the table factory for NVMeVirt CSD MVCC-filter offload (naive v1
+  // baseline). Wrapping happens unconditionally here at
+  // CF-options-resolution time (sysvars
+  // aren't guaranteed to be applied yet at DB::Open()); actual offload
+  // execution is gated later, per-scan, by the rocksdb_nvmevirt_enabled
+  // sysvar inside NvmeVirtTableReader::NewIterator(). The on-device kernel
+  // parses raw block bytes directly, so these column families must not use
+  // block compression.
+  if (cf_name.compare(0, NVMEVIRT_CF_NAME_PREFIX.size(),
+                      NVMEVIRT_CF_NAME_PREFIX) == 0) {
+    opts->table_factory =
+        std::make_shared<NvmeVirtTableFactory>(opts->table_factory);
+    opts->compression = rocksdb::kNoCompression;
+  }
 
   // this sst partitioner is used in bulk load scenario, no need to set it for
   // non-data cfs.
