@@ -137,9 +137,9 @@ rocksdb::Status NvmeVirtTableReader::RunMvccFilter(uint64_t snapshot_seq,
   // kSlmPageSize must be a multiple of the device's SLM_PAGE_SIZE --
   // hardcoded here rather than shared via a common header, since that is a
   // kernel-module-only header (linux/kthread.h etc.) not includable from
-  // this userspace plugin code. Only the ALLOCATION request is rounded up;
-  // file_size_ itself stays unaligned everywhere else (csdvirt_execute,
-  // sstable_size) since the kernel-side parser needs the true byte count.
+  // this userspace plugin code. Only sizes handed to the device are rounded
+  // up; file_size_ itself stays unaligned in sstable_size, since the
+  // kernel-side parser needs the true byte count to locate the footer.
   constexpr size_t kSlmPageSize = 16 * 1024;
   auto align_up_to_slm_page = [](size_t size) {
     return (size + kSlmPageSize - 1) & ~(kSlmPageSize - 1);
@@ -188,9 +188,15 @@ rocksdb::Status NvmeVirtTableReader::RunMvccFilter(uint64_t snapshot_seq,
   params.rocksdb_mvcc_filter_params.snapshot_seq = snapshot_seq;
   params.rocksdb_mvcc_filter_params.output_capacity = output_capacity;
 
+  // The device tracks output readiness for min(allocation, this value) bytes
+  // and leaves the rest untracked, where a host read never comes ready. Our
+  // output allocation is 2x the file, so pass that, not file_size_. The
+  // program takes the real file length from sstable_size.
+  const size_t task_span = align_up_to_slm_page(output_capacity);
+
   size_t result_len = 0;
   int rc = csdvirt->csdvirt_execute(ROCKSDB_MVCC_FILTER_PROGRAM_INDEX,
-                                     input_addr, output_addr, file_size_,
+                                     input_addr, output_addr, task_span,
                                      &params, sizeof(params), &result_len);
   if (rc < 0) {
     nvmevirt_log("RunMvccFilter: csdvirt_execute failed (rc=%d) for %s\n", rc,
@@ -200,23 +206,65 @@ rocksdb::Status NvmeVirtTableReader::RunMvccFilter(uint64_t snapshot_seq,
     return rocksdb::Status::Aborted("csdvirt_execute failed");
   }
   auto t_execute = clock::now();
-  if (result_len == 0 || result_len > output_capacity) {
-    result_len = output_capacity;  // fall back to reading the whole buffer
+
+  // Sync completes execute when the program finishes and returns the output
+  // length. Async completes at dispatch and returns -1, arriving as
+  // 0xFFFFFFFF through the 32-bit result field; the length then has to be
+  // found by reading until the output runs out. output_capacity is bounded by
+  // 2 * rocksdb_nvmevirt_max_sst_bytes, so a real length never reaches the
+  // sentinel.
+  constexpr size_t kNoResultSentinel = 0xFFFFFFFFu;
+  constexpr size_t kHeaderLen = sizeof(struct rocksdb_mvcc_filter_output);
+  const bool length_known = result_len != 0 &&
+                            result_len != kNoResultSentinel &&
+                            result_len <= output_capacity;
+
+  const size_t read_limit = length_known ? result_len : output_capacity;
+  std::unique_ptr<char[]> host_buf(new char[read_limit]);
+
+  // csdvirt_read_slm() asserts on sizes above MAX_IO_SPLIT_SIZE, so split.
+  // A short chunk means the device clamped against the end of the output.
+  auto read_range = [&](size_t off, size_t want, size_t *got_out) -> bool {
+    size_t done = 0;
+    while (done < want) {
+      size_t chunk = want - done;
+      if (chunk > MAX_IO_SPLIT_SIZE) chunk = MAX_IO_SPLIT_SIZE;
+      size_t got = csdvirt->csdvirt_read_slm(host_buf.get() + off + done,
+                                             output_addr + off + done, chunk);
+      if (got > chunk) return false;  // (size_t)-1 on ioctl failure
+      done += got;
+      if (got < chunk) break;
+    }
+    *got_out = done;
+    return true;
+  };
+
+  size_t stream_len = 0;
+  bool read_ok = false;
+  if (length_known) {
+    size_t got = 0;
+    read_ok = read_range(0, result_len, &got);
+    result_len = got;
+    stream_len = (got > kHeaderLen) ? got - kHeaderLen : 0;
+  } else {
+    // Payload first, header last. The program writes the header at offset 0
+    // only after emitting every entry, so an early read of it returns zeros.
+    // End of output is reported only once the program has returned, so by
+    // then the header is written.
+    read_ok = read_range(kHeaderLen, output_capacity - kHeaderLen, &stream_len);
+    if (read_ok) {
+      size_t got = 0;
+      read_ok = read_range(0, kHeaderLen, &got) && got == kHeaderLen;
+    }
+    result_len = kHeaderLen + stream_len;
   }
 
-  // csdvirt_read_slm() enforces MAX_IO_SPLIT_SIZE (256KB, CSDVirt.hpp -- an
-  // MDTS-style single-transfer cap) via a hard assert, not a soft truncation.
-  // A single call here worked for the tiny correctness-test table (44-byte
-  // result) but asserts for any real-sized workload, whose filtered output
-  // (or the output_capacity fallback above, itself 2x a real SST's size)
-  // routinely exceeds 256KB. Split into MAX_IO_SPLIT_SIZE-sized chunks.
-  std::unique_ptr<char[]> host_buf(new char[result_len]);
-  for (size_t read_off = 0; read_off < result_len; ) {
-    size_t chunk = result_len - read_off;
-    if (chunk > MAX_IO_SPLIT_SIZE) chunk = MAX_IO_SPLIT_SIZE;
-    csdvirt->csdvirt_read_slm(host_buf.get() + read_off, output_addr + read_off,
-                              chunk);
-    read_off += chunk;
+  if (!read_ok) {
+    nvmevirt_log("RunMvccFilter: csdvirt_read_slm failed for %s\n",
+                 file_path_.c_str());
+    csdvirt->csdvirt_release_memory(input_addr);
+    csdvirt->csdvirt_release_memory(output_addr);
+    return rocksdb::Status::Aborted("csdvirt_read_slm failed");
   }
   auto t_read = clock::now();
 
@@ -224,19 +272,18 @@ rocksdb::Status NvmeVirtTableReader::RunMvccFilter(uint64_t snapshot_seq,
   csdvirt->csdvirt_release_memory(output_addr);
   auto t_release = clock::now();
 
-  if (result_len < sizeof(struct rocksdb_mvcc_filter_output)) {
+  if (result_len < kHeaderLen) {
     return rocksdb::Status::Corruption(
         "NvmeVirt mvcc_filter output shorter than its own header");
   }
 
   struct rocksdb_mvcc_filter_output header;
-  memcpy(&header, host_buf.get(), sizeof(header));
+  memcpy(&header, host_buf.get(), kHeaderLen);
   *keys_seen = header.keys_seen;
   *keys_filtered = header.keys_filtered;
 
-  const size_t stream_len = result_len - sizeof(header);
   char *stream_buf = new char[stream_len];
-  memcpy(stream_buf, host_buf.get() + sizeof(header), stream_len);
+  memcpy(stream_buf, host_buf.get() + kHeaderLen, stream_len);
 
   *out_buf = stream_buf;
   *out_len = stream_len;
