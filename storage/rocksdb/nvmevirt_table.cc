@@ -145,14 +145,20 @@ rocksdb::Status NvmeVirtTableReader::RunMvccFilter(uint64_t snapshot_seq,
     return (size + kSlmPageSize - 1) & ~(kSlmPageSize - 1);
   };
 
+  // csdvirt_alloc_memory returns an SLM offset, and returns (size_t)-1 on
+  // failure. Offset 0 is a valid allocation, the one a freshly loaded module
+  // hands out first, so testing for 0 rejected a good address and made the
+  // first offload of every session fall back to the host path.
+  constexpr size_t kAllocFailed = static_cast<size_t>(-1);
+
   size_t input_addr =
       csdvirt->csdvirt_alloc_memory(align_up_to_slm_page(file_size_));
-  if (input_addr == 0) {
+  if (input_addr == kAllocFailed) {
     return rocksdb::Status::Aborted("csdvirt_alloc_memory(input) failed");
   }
   size_t output_addr =
       csdvirt->csdvirt_alloc_memory(align_up_to_slm_page(output_capacity));
-  if (output_addr == 0) {
+  if (output_addr == kAllocFailed) {
     csdvirt->csdvirt_release_memory(input_addr);
     return rocksdb::Status::Aborted("csdvirt_alloc_memory(output) failed");
   }
