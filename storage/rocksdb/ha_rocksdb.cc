@@ -809,6 +809,8 @@ bool rocksdb_nvmevirt_enabled = false;
 /* Use unsigned long long instead of uint64_t because of MySQL compatibility */
 unsigned long long  // NOLINT(runtime/int)
     rocksdb_nvmevirt_max_sst_bytes = 256ULL * 1024 * 1024;
+unsigned long rocksdb_nvmevirt_group_size = 0;
+bool rocksdb_nvmevirt_group_wait_whole = false;
 static bool rocksdb_print_snapshot_conflict_queries = false;
 static bool rocksdb_allow_to_start_after_corruption = false;
 static ulong rocksdb_write_policy = rocksdb::TxnDBWritePolicy::WRITE_COMMITTED;
@@ -1345,6 +1347,25 @@ static MYSQL_SYSVAR_BOOL(
     "'nvmevirt_'. Naive v1 baseline: filters one SST file at a time; "
     "cross-file/cross-level correctness still relies on RocksDB's own "
     "unmodified MergingIterator/DBIter.",
+    nullptr, nullptr, false);
+
+static MYSQL_SYSVAR_ULONG(
+    nvmevirt_group_size, rocksdb_nvmevirt_group_size, PLUGIN_VAR_RQCMDARG,
+    "SSTs covered by one NVMeVirt MVCC-filter command. 0 keeps the original "
+    "whole-file command. 1 or more switches to the grouped program, which "
+    "loads each file tail first so the device has the index before the data; "
+    "2 or more also overlaps the next file's load with this file's compute. "
+    "Members come from one level, so this changes transport only, never which "
+    "entries are filtered. Each member needs its own input slot and a ~2x "
+    "output slot in SLM at once, so raising this scales the SLM budget.",
+    nullptr, nullptr, /*default=*/0, /*min=*/0, /*max=*/4, /*block=*/0);
+
+static MYSQL_SYSVAR_BOOL(
+    nvmevirt_group_wait_whole, rocksdb_nvmevirt_group_wait_whole,
+    PLUGIN_VAR_RQCMDARG,
+    "Diagnostic arm for nvmevirt_group_size: load each slot unrotated and have "
+    "the device wait for the whole file before parsing it, so grouping can be "
+    "measured without the tail-first streaming.",
     nullptr, nullptr, false);
 
 static MYSQL_SYSVAR_ULONGLONG(
@@ -2802,6 +2823,8 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(enable_remove_orphaned_dropped_cfs),
     MYSQL_SYSVAR(nvmevirt_enabled),
     MYSQL_SYSVAR(nvmevirt_max_sst_bytes),
+    MYSQL_SYSVAR(nvmevirt_group_size),
+    MYSQL_SYSVAR(nvmevirt_group_wait_whole),
     MYSQL_SYSVAR(nvmevirt_olap_session),
     MYSQL_SYSVAR(enable_udt_in_mem),
     MYSQL_SYSVAR(tmpdir),

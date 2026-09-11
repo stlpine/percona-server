@@ -19,6 +19,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
@@ -46,6 +47,17 @@ extern bool rocksdb_nvmevirt_enabled;
 // buddy allocator rounding up on allocation.
 extern unsigned long long  // NOLINT(runtime/int)
     rocksdb_nvmevirt_max_sst_bytes;
+
+// How many SSTs one offload command covers, 1 to 4. Each file is loaded tail
+// first so the device can parse the index before the data lands; at 2 or more
+// the next file's load also overlaps this file's compute. Members come from
+// one level, so this changes transport only, never what gets filtered.
+extern unsigned long rocksdb_nvmevirt_group_size;
+
+// Diagnostic arm: load each slot unrotated and have the device wait for all of
+// it before parsing. Isolates grouping-without-streaming from
+// grouping-with-streaming without a rebuild.
+extern bool rocksdb_nvmevirt_group_wait_whole;
 
 // Caller-restriction check: true iff `thd`'s session has
 // `SET [SESSION] rocksdb_nvmevirt_olap_session = 1`. Defined in ha_rocksdb.cc
@@ -178,6 +190,24 @@ class NvmeVirtTableReader : public rocksdb::TableReader {
     inner_->Prepare(target);
   }
 
+  // One member of a grouped command. tail_start is where the index, metaindex
+  // and footer begin, rounded DOWN to 512 because csdvirt_load_part_of_file
+  // aligns its source offset down and would otherwise skew the slot.
+  struct GroupFile {
+    std::string path;
+    uint64_t size;
+    uint64_t tail_start;
+  };
+
+  // One command over `files`. On success `streams[i]` owns the flat KV stream
+  // for files[i] and the caller must delete[] each one.
+  struct GroupStream {
+    char *buf;
+    size_t len;
+    uint64_t keys_seen;
+    uint64_t keys_filtered;
+  };
+
  private:
   // Runs the full alloc/load/execute/read_slm/release sequence against the CSD
   // for this SST file. On success, *out_buf is a heap-allocated buffer (caller
@@ -188,6 +218,21 @@ class NvmeVirtTableReader : public rocksdb::TableReader {
   rocksdb::Status RunMvccFilter(uint64_t snapshot_seq, char **out_buf,
                                 size_t *out_len, uint64_t *keys_seen,
                                 uint64_t *keys_filtered) const;
+
+  // File offset of this SST's tail (index + metaindex + footer), or 0 if the
+  // table properties do not carry one, in which case the file cannot be
+  // streamed and the caller falls back.
+  uint64_t TailStartOffset() const;
+
+  // Files at the same level whose key ranges follow this one, up to `want`
+  // entries including this file itself. Same level means disjoint key ranges,
+  // so a group never changes which entries are filtered, only how the bytes
+  // move.
+  std::vector<GroupFile> DiscoverGroup(size_t want) const;
+
+  static rocksdb::Status RunMvccFilterGroup(
+      uint64_t snapshot_seq, const std::vector<GroupFile> &files,
+      std::vector<GroupStream> *streams);
 
   std::unique_ptr<rocksdb::TableReader> inner_;
   std::string file_path_;
